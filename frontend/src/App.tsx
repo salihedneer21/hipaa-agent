@@ -10,7 +10,7 @@ import { DiagramsBrowser } from './components/DiagramsBrowser';
 import { MermaidViewer } from './components/MermaidViewer';
 import { SessionsDialog } from './components/SessionsDialog';
 import { useAnalysis } from './hooks/useAnalysis';
-import { Eye, GitCompare, History, Shield, Search, Wrench, X } from 'lucide-react';
+import { Eye, GitCompare, History, Shield, Search, Wrench, X, Github, Building2, Lock, Globe, RefreshCw, Plus, ChevronDown } from 'lucide-react';
 import type { Diagram, Patch, SessionStatus } from './types';
 import { apiFetch } from './api';
 
@@ -601,13 +601,16 @@ function App() {
     return null;
   }, [error]);
 
-  const githubConnectedLabel = useMemo(() => {
+  const currentGithubInstallation = useMemo(() => {
     if (githubInstallations.length === 0) return null;
-    const selected = selectedGithubInstallationId
+    return selectedGithubInstallationId
       ? githubInstallations.find(i => i.installationId === selectedGithubInstallationId)
       : githubInstallations[0];
-    return selected?.accountLogin || 'Connected';
   }, [githubInstallations, selectedGithubInstallationId]);
+
+  const githubConnectedLabel = useMemo(() => {
+    return currentGithubInstallation?.accountLogin || (githubInstallations.length > 0 ? 'Connected' : null);
+  }, [currentGithubInstallation, githubInstallations.length]);
 
   function isLikelyLocalRepoInput(value: string): boolean {
     const raw = (value || '').trim();
@@ -1677,8 +1680,11 @@ function App() {
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="dialog-content github-dialog">
-            <div className="dialog-header">
-              <Dialog.Title className="dialog-title">GitHub</Dialog.Title>
+            <div className="dialog-header github-header">
+              <Dialog.Title className="dialog-title">
+                <Github size={20} />
+                GitHub
+              </Dialog.Title>
               <Dialog.Close className="dialog-close" aria-label="Close">
                 <X size={16} />
               </Dialog.Close>
@@ -1686,40 +1692,51 @@ function App() {
 
             <div className="dialog-body github-body">
               {!githubConfigured ? (
-                <div className="dialog-error">
-                  <strong>GitHub App is not configured.</strong>
-                  <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
-                    Set <code>GITHUB_APP_SLUG</code>, <code>GITHUB_APP_ID</code>, <code>GITHUB_APP_PRIVATE_KEY</code> (or <code>GITHUB_APP_PRIVATE_KEY_PATH</code>),
+                <div className="github-not-configured">
+                  <div className="github-not-configured-icon">
+                    <Github size={32} />
+                  </div>
+                  <div className="github-not-configured-title">GitHub App Not Configured</div>
+                  <div className="github-not-configured-text">
+                    Set <code>GITHUB_APP_SLUG</code>, <code>GITHUB_APP_ID</code>, <code>GITHUB_APP_PRIVATE_KEY</code>,
                     and <code>HIPAA_AGENT_FRONTEND_URL</code> on the backend.
                   </div>
                 </div>
               ) : githubInstallations.length === 0 ? (
                 <div className="github-empty">
-                  <div className="github-empty-title">Connect GitHub to scan private repos and create PRs.</div>
+                  <div className="github-empty-icon">
+                    <Github size={40} />
+                  </div>
+                  <div className="github-empty-title">Connect Your GitHub Account</div>
+                  <div className="github-empty-text">Scan private repositories and create pull requests with AI-generated fixes.</div>
                   {githubError && (
-                    <div className="dialog-error" style={{ marginTop: 12 }}>
+                    <div className="dialog-error" style={{ marginTop: 16 }}>
                       <strong>Error:</strong> {githubError}
                     </div>
                   )}
-                  <div style={{ marginTop: 14 }}>
-                    <button className="btn btn-primary" type="button" onClick={connectGitHub} disabled={githubLoading}>
-                      {githubLoading ? (
-                        <>
-                          <span className="spinner" />
-                          Redirecting…
-                        </>
-                      ) : (
-                        'Connect GitHub'
-                      )}
-                    </button>
-                  </div>
+                  <button className="btn btn-primary github-connect-btn" type="button" onClick={connectGitHub} disabled={githubLoading}>
+                    {githubLoading ? (
+                      <>
+                        <span className="spinner" />
+                        Redirecting…
+                      </>
+                    ) : (
+                      <>
+                        <Github size={18} />
+                        Connect GitHub
+                      </>
+                    )}
+                  </button>
                 </div>
               ) : (
                 <>
                   <div className="github-controls">
-                    <label className="github-select">
-                      <span>Installation</span>
+                    <div className="github-select-wrapper">
+                      <div className="github-select-icon">
+                        {currentGithubInstallation?.accountType === 'Organization' ? <Building2 size={18} /> : <Github size={18} />}
+                      </div>
                       <select
+                        className="github-select"
                         value={selectedGithubInstallationId || githubInstallations[0]?.installationId || ''}
                         onChange={(e) => {
                           const n = Number(e.target.value);
@@ -1733,25 +1750,28 @@ function App() {
                           </option>
                         ))}
                       </select>
-                    </label>
+                      <ChevronDown size={16} className="github-select-chevron" />
+                    </div>
 
                     <div className="github-controls-actions">
                       <button
-                        className="btn btn-secondary btn-sm"
+                        className="btn btn-secondary btn-icon"
                         type="button"
                         onClick={() => selectedGithubInstallationId && refreshGitHubRepos(selectedGithubInstallationId)}
                         disabled={githubLoading || !selectedGithubInstallationId}
+                        title="Refresh repositories"
                       >
-                        Refresh
+                        <RefreshCw size={16} className={githubLoading ? 'spinning' : ''} />
                       </button>
                       <button
-                        className="btn btn-secondary btn-sm"
+                        className="btn btn-secondary"
                         type="button"
                         onClick={connectGitHub}
                         disabled={githubLoading}
                         title="Install the GitHub App on another account or organization"
                       >
-                        Add org/account
+                        <Plus size={16} />
+                        Add account
                       </button>
                     </div>
                   </div>
@@ -1762,7 +1782,7 @@ function App() {
                       type="text"
                       value={githubRepoSearch}
                       onChange={(e) => setGithubRepoSearch(e.target.value)}
-                      placeholder="Search repos…"
+                      placeholder="Search repositories…"
                       disabled={githubLoading}
                     />
                   </div>
@@ -1796,14 +1816,32 @@ function App() {
                               setRepoUrl(r.fullName);
                               setGithubDialogOpen(false);
                             }}
-                            title={r.fullName}
+                            title={`Select ${r.fullName}`}
                           >
-                            <span className="github-repo-name">{r.fullName}</span>
-                            {r.private && <span className="github-repo-badge private">Private</span>}
+                            <div className="github-repo-info">
+                              <Github size={16} className="github-repo-icon" />
+                              <span className="github-repo-name">{r.fullName}</span>
+                            </div>
+                            <div className="github-repo-meta">
+                              {r.private ? (
+                                <span className="github-repo-badge private">
+                                  <Lock size={11} />
+                                  Private
+                                </span>
+                              ) : (
+                                <span className="github-repo-badge public">
+                                  <Globe size={11} />
+                                  Public
+                                </span>
+                              )}
+                            </div>
                           </button>
                         ))}
                       {githubRepos.length === 0 && (
-                        <div className="github-repo-empty">No repositories found for this installation.</div>
+                        <div className="github-repo-empty">
+                          <Github size={24} />
+                          <span>No repositories found for this installation.</span>
+                        </div>
                       )}
                     </div>
                   )}

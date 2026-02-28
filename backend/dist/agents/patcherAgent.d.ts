@@ -1,6 +1,6 @@
 /**
  * Security Patcher Agent
- * Generates patches for HIPAA compliance issues
+ * Generates patches for HIPAA compliance issues using OpenAI Agents SDK
  */
 import { Finding, AnalysisResult } from './analyzerAgent.js';
 import { RepoFile } from '../services/githubService.js';
@@ -18,8 +18,7 @@ export interface PatchResult {
     patches: Patch[];
 }
 export declare class PatcherAgent {
-    private client;
-    private model;
+    private agent;
     constructor(model?: string);
     generatePatch(filePath: string, content: string, findings: Finding[]): Promise<Patch>;
     private parsePatchResponse;

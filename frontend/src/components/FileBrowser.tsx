@@ -2,6 +2,7 @@ import { useState } from 'react';
 import * as ScrollArea from '@radix-ui/react-scroll-area';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { FileCode, Folder, ChevronRight, ChevronDown, AlertTriangle } from 'lucide-react';
+import type { Finding, Patch } from '../types';
 
 interface FileNode {
   name: string;
@@ -14,8 +15,8 @@ interface FileNode {
 
 interface FileBrowserProps {
   files: string[];
-  findings: { file: string }[];
-  patches: { file: string }[];
+  findings: Finding[];
+  patches: Patch[];
   selectedFile: string | null;
   onSelectFile: (path: string) => void;
 }
@@ -72,8 +73,8 @@ function FileTreeNode({
   depth = 0,
 }: {
   node: FileNode;
-  findings: { file: string }[];
-  patches: { file: string }[];
+  findings: Finding[];
+  patches: Patch[];
   selectedFile: string | null;
   onSelectFile: (path: string) => void;
   depth?: number;
@@ -81,7 +82,8 @@ function FileTreeNode({
   const [isOpen, setIsOpen] = useState(depth < 2);
 
   const issueCount = findings.filter(f => f.file === node.path).length;
-  const hasPatch = patches.some(p => p.file === node.path);
+  const patch = patches.find(p => p.file === node.path);
+  const patchLabel = patch?.appliedAt ? 'Applied' : patch ? 'Patch' : null;
   const isSelected = selectedFile === node.path;
 
   if (node.type === 'folder') {
@@ -130,8 +132,8 @@ function FileTreeNode({
       {issueCount > 0 && (
         <AlertTriangle size={12} className="issue-icon" />
       )}
-      {hasPatch && (
-        <span className="patch-badge">Fixed</span>
+      {patchLabel && (
+        <span className="patch-badge">{patchLabel}</span>
       )}
     </div>
   );

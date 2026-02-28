@@ -1,30 +1,110 @@
 /**
- * GitHub Repository Service
- * Clones and extracts code from GitHub repositories
+ * Repository Service
+ * Clones and reads source from Git repositories (GitHub URLs supported)
  */
-import simpleGit from 'simple-git';
+import { simpleGit } from 'simple-git';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
-import { v4 as uuidv4 } from 'uuid';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { ANALYZABLE_EXTENSIONS, SKIP_DIRECTORIES } from '../knowledge/hipaaRules.js';
+import { getSessionRepoDir } from '../utils/storagePaths.js';
 export class GitHubService {
-    tempDir = null;
-    async cloneRepo(repoUrl) {
-        // Normalize URL
-        if (!repoUrl.startsWith('http')) {
-            repoUrl = `https://github.com/${repoUrl}`;
+    resolveLocalRepoPath(repoUrl) {
+        const raw = (repoUrl || '').trim();
+        if (!raw)
+            return null;
+        // file:// URLs
+        if (raw.startsWith('file:')) {
+            try {
+                return fileURLToPath(raw);
+            }
+            catch {
+                return null;
+            }
         }
-        // Create temp directory
-        const tempBase = path.join(os.tmpdir(), 'hipaa-analysis');
-        await fs.mkdir(tempBase, { recursive: true });
-        this.tempDir = path.join(tempBase, uuidv4());
-        await fs.mkdir(this.tempDir, { recursive: true });
-        const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repo';
-        const clonePath = path.join(this.tempDir, repoName);
+        // Home-relative paths
+        if (raw === '~')
+            return os.homedir();
+        if (raw.startsWith('~/'))
+            return path.join(os.homedir(), raw.slice(2));
+        // Absolute or relative filesystem paths
+        if (path.isAbsolute(raw) || raw.startsWith('./') || raw.startsWith('../')) {
+            return path.resolve(raw);
+        }
+        // Windows drive path (best-effort)
+        if (/^[A-Za-z]:[\\/]/.test(raw)) {
+            return path.resolve(raw);
+        }
+        return null;
+    }
+    normalizeRepoUrl(repoUrl) {
+        const local = this.resolveLocalRepoPath(repoUrl);
+        if (local) {
+            try {
+                return pathToFileURL(local).toString();
+            }
+            catch {
+                return local;
+            }
+        }
+        if (!repoUrl.startsWith('http')) {
+            return `https://github.com/${repoUrl}`;
+        }
+        return repoUrl;
+    }
+    async cloneRepoToSession(sessionId, repoUrl) {
+        const normalizedRepoUrl = this.normalizeRepoUrl(repoUrl);
+        const clonePath = getSessionRepoDir(sessionId);
+        // Ensure clean destination (a sessionId should be unique, but be defensive).
+        await fs.rm(clonePath, { recursive: true, force: true });
+        await fs.mkdir(path.dirname(clonePath), { recursive: true });
         const git = simpleGit();
-        await git.clone(repoUrl, clonePath, ['--depth', '1']);
-        return clonePath;
+        await git.clone(normalizedRepoUrl, clonePath, ['--depth', '1']);
+        let commitHash;
+        try {
+            const repoGit = simpleGit({ baseDir: clonePath });
+            commitHash = (await repoGit.revparse(['HEAD'])).trim();
+        }
+        catch {
+            commitHash = undefined;
+        }
+        return { repoPath: clonePath, normalizedRepoUrl, commitHash };
+    }
+    async copyLocalRepoToSession(sessionId, localRepoPath) {
+        const absPath = path.resolve(localRepoPath);
+        const stat = await fs.stat(absPath);
+        if (!stat.isDirectory()) {
+            throw new Error(`Local path is not a directory: ${absPath}`);
+        }
+        const normalizedRepoUrl = (() => {
+            try {
+                return pathToFileURL(absPath).toString();
+            }
+            catch {
+                return absPath;
+            }
+        })();
+        const clonePath = getSessionRepoDir(sessionId);
+        await fs.rm(clonePath, { recursive: true, force: true });
+        await fs.mkdir(clonePath, { recursive: true });
+        const fileTree = await this.getFileTree(absPath);
+        for (const relPath of fileTree) {
+            const from = path.join(absPath, relPath);
+            const to = path.join(clonePath, relPath);
+            await fs.mkdir(path.dirname(to), { recursive: true });
+            await fs.copyFile(from, to);
+        }
+        const readme = await this.getReadme(absPath);
+        let commitHash;
+        try {
+            const repoGit = simpleGit({ baseDir: absPath });
+            commitHash = (await repoGit.revparse(['HEAD'])).trim();
+        }
+        catch {
+            commitHash = undefined;
+        }
+        return { repoPath: clonePath, normalizedRepoUrl, commitHash, fileTree, readme };
     }
     async getFileTree(repoPath) {
         const files = [];
@@ -62,6 +142,35 @@ export class GitHubService {
             return '';
         }
     }
+    async readFilePreview(repoPath, filePath, maxBytes) {
+        const fullPath = path.join(repoPath, filePath);
+        if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
+            return { content: await this.readFile(repoPath, filePath), truncated: false };
+        }
+        try {
+            const handle = await fs.open(fullPath, 'r');
+            try {
+                const buffer = Buffer.alloc(Math.min(maxBytes, 512_000));
+                const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+                const stat = await fs.stat(fullPath);
+                return {
+                    content: buffer.subarray(0, bytesRead).toString('utf-8'),
+                    truncated: stat.size > bytesRead,
+                };
+            }
+            finally {
+                await handle.close();
+            }
+        }
+        catch {
+            return { content: '', truncated: false };
+        }
+    }
+    async writeFile(repoPath, filePath, content) {
+        const fullPath = path.join(repoPath, filePath);
+        await fs.mkdir(path.dirname(fullPath), { recursive: true });
+        await fs.writeFile(fullPath, content, 'utf-8');
+    }
     async getReadme(repoPath) {
         const readmeNames = ['README.md', 'README.rst', 'README.txt', 'README'];
         for (const name of readmeNames) {
@@ -75,30 +184,22 @@ export class GitHubService {
         }
         return null;
     }
-    async fetchRepoForAnalysis(repoUrl) {
-        const repoPath = await this.cloneRepo(repoUrl);
+    async fetchRepoForAnalysis(sessionId, repoUrl) {
+        const local = this.resolveLocalRepoPath(repoUrl);
+        if (local) {
+            const localResult = await this.copyLocalRepoToSession(sessionId, local);
+            return {
+                repoPath: localResult.repoPath,
+                readme: localResult.readme,
+                fileTree: localResult.fileTree,
+                normalizedRepoUrl: localResult.normalizedRepoUrl,
+                commitHash: localResult.commitHash,
+            };
+        }
+        const { repoPath, normalizedRepoUrl, commitHash } = await this.cloneRepoToSession(sessionId, repoUrl);
         const fileTree = await this.getFileTree(repoPath);
         const readme = await this.getReadme(repoPath);
-        // Read all files
-        const files = [];
-        for (const filePath of fileTree) {
-            const content = await this.readFile(repoPath, filePath);
-            if (content) {
-                files.push({ path: filePath, content });
-            }
-        }
-        return { repoPath, files, readme, fileTree };
-    }
-    async cleanup() {
-        if (this.tempDir) {
-            try {
-                await fs.rm(this.tempDir, { recursive: true, force: true });
-            }
-            catch {
-                // Ignore cleanup errors
-            }
-            this.tempDir = null;
-        }
+        return { repoPath, readme, fileTree, normalizedRepoUrl, commitHash };
     }
 }
 export const githubService = new GitHubService();

@@ -1,6 +1,6 @@
 /**
- * GitHub Repository Service
- * Clones and extracts code from GitHub repositories
+ * Repository Service
+ * Clones and reads source from Git repositories (GitHub URLs supported)
  */
 export interface RepoFile {
     path: string;
@@ -8,17 +8,28 @@ export interface RepoFile {
 }
 export interface RepoData {
     repoPath: string;
-    files: RepoFile[];
     readme: string | null;
     fileTree: string[];
+    normalizedRepoUrl: string;
+    commitHash?: string;
 }
 export declare class GitHubService {
-    private tempDir;
-    cloneRepo(repoUrl: string): Promise<string>;
+    private resolveLocalRepoPath;
+    normalizeRepoUrl(repoUrl: string): string;
+    cloneRepoToSession(sessionId: string, repoUrl: string): Promise<{
+        repoPath: string;
+        normalizedRepoUrl: string;
+        commitHash?: string;
+    }>;
+    private copyLocalRepoToSession;
     getFileTree(repoPath: string): Promise<string[]>;
     readFile(repoPath: string, filePath: string): Promise<string>;
+    readFilePreview(repoPath: string, filePath: string, maxBytes: number): Promise<{
+        content: string;
+        truncated: boolean;
+    }>;
+    writeFile(repoPath: string, filePath: string, content: string): Promise<void>;
     getReadme(repoPath: string): Promise<string | null>;
-    fetchRepoForAnalysis(repoUrl: string): Promise<RepoData>;
-    cleanup(): Promise<void>;
+    fetchRepoForAnalysis(sessionId: string, repoUrl: string): Promise<RepoData>;
 }
 export declare const githubService: GitHubService;

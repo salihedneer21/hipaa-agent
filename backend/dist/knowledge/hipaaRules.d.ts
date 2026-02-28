@@ -8,6 +8,10 @@ export interface HIPAARule {
     severity: 'critical' | 'high' | 'medium' | 'low';
     patterns: string[];
     remediation: string;
+    whyItMatters: string;
+    howItHappens: string;
+    properFix: string;
+    hipaaReference: string;
 }
 export declare const HIPAA_RULES: Record<string, HIPAARule>;
 export declare const ANALYZABLE_EXTENSIONS: string[];

@@ -1,69 +1,15 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import type { AnalysisResponse, AnalysisResult, Diagram, Patch, SessionStatus } from '../types';
 
-interface Finding {
-  ruleId: string;
-  ruleName: string;
-  severity: 'critical' | 'high' | 'medium' | 'low';
-  file: string;
-  line: number;
-  code?: string;
-  issue: string;
-  remediation: string;
-}
-
-interface AnalysisResult {
-  totalFiles: number;
-  analyzedFiles: number;
-  totalFindings: number;
-  findingsBySeverity: {
-    critical: Finding[];
-    high: Finding[];
-    medium: Finding[];
-    low: Finding[];
-  };
-  allFindings: Finding[];
-}
-
-interface Patch {
-  file: string;
-  patchedContent: string | null;
-  changes: string[];
-  explanation: string;
-}
-
-interface PatchResult {
-  totalFiles: number;
-  patchesGenerated: number;
-  patches: Patch[];
-}
-
-interface RepoFile {
-  path: string;
-  content: string;
-}
-
-interface AnalysisResponse {
-  repoUrl: string;
-  readme: string | null;
-  filesAnalyzed: number;
-  files: RepoFile[];
-  analysis: AnalysisResult;
-  patches: PatchResult | null;
-}
-
-interface SessionStatus {
-  status: 'pending' | 'analyzing' | 'patching' | 'complete' | 'error';
-  progress: number;
-  message: string;
-  result?: AnalysisResponse;
-  error?: string;
-}
+const LAST_SESSION_ID_KEY = 'hipaa-agent:lastSessionId';
 
 export function useAnalysis() {
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
   const [result, setResult] = useState<AnalysisResponse | null>(null);
+  const [sessionStatus, setSessionStatus] = useState<SessionStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -82,32 +28,59 @@ export function useAnalysis() {
   const pollStatus = useCallback(async (sessionId: string) => {
     try {
       const response = await fetch(`/api/analyze/${sessionId}`);
+      if (!response.ok) {
+        throw new Error('Failed to get analysis status');
+      }
       const data: SessionStatus = await response.json();
 
       setProgress(data.progress);
       setStatusMessage(data.message);
+      setSessionStatus(data);
 
       if (data.status === 'complete' && data.result) {
         clearPoll();
         setResult(data.result);
+        setSessionId(data.result.sessionId);
         setIsLoading(false);
+        setSessionStatus(null);
       } else if (data.status === 'error') {
         clearPoll();
         setError(data.error || 'Analysis failed');
         setIsLoading(false);
+        setSessionStatus(null);
       }
     } catch {
       clearPoll();
       setError('Failed to get analysis status');
       setIsLoading(false);
+      setSessionStatus(null);
     }
   }, [clearPoll]);
 
-  const analyze = useCallback(async (repoUrl: string, generatePatches: boolean = true) => {
+  const resume = useCallback((id: string) => {
+    if (!id) return;
+    setSessionId(id);
+    setIsLoading(true);
+    setProgress(0);
+    setStatusMessage('Restoring session...');
+    setResult(null);
+    setSessionStatus(null);
+    setError(null);
+    localStorage.setItem(LAST_SESSION_ID_KEY, id);
+    clearPoll();
+
+    pollIntervalRef.current = setInterval(() => {
+      pollStatus(id);
+    }, 1000);
+    pollStatus(id);
+  }, [clearPoll, pollStatus]);
+
+  const analyze = useCallback(async (repoUrl: string) => {
     setIsLoading(true);
     setProgress(0);
     setStatusMessage('Starting analysis...');
     setResult(null);
+    setSessionStatus(null);
     setError(null);
     clearPoll();
 
@@ -115,7 +88,7 @@ export function useAnalysis() {
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repoUrl, generatePatches }),
+        body: JSON.stringify({ repoUrl }),
       });
 
       if (!response.ok) {
@@ -123,6 +96,8 @@ export function useAnalysis() {
       }
 
       const { sessionId } = await response.json();
+      setSessionId(sessionId);
+      localStorage.setItem(LAST_SESSION_ID_KEY, sessionId);
 
       // Start polling
       pollIntervalRef.current = setInterval(() => {
@@ -132,8 +107,16 @@ export function useAnalysis() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Analysis failed');
       setIsLoading(false);
+      setSessionStatus(null);
     }
   }, [clearPoll, pollStatus]);
+
+  // Auto-restore last session on refresh.
+  useEffect(() => {
+    if (result || isLoading || sessionId) return;
+    const last = localStorage.getItem(LAST_SESSION_ID_KEY);
+    if (last) resume(last);
+  }, [isLoading, result, resume, sessionId]);
 
   const reset = useCallback(() => {
     clearPoll();
@@ -141,15 +124,65 @@ export function useAnalysis() {
     setProgress(0);
     setStatusMessage('');
     setResult(null);
+    setSessionStatus(null);
     setError(null);
+    setSessionId(null);
+    localStorage.removeItem(LAST_SESSION_ID_KEY);
   }, [clearPoll]);
+
+  const upsertPatch = useCallback((patch: Patch) => {
+    setResult(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        patches: [
+          ...prev.patches.filter(p => p.file !== patch.file),
+          patch,
+        ],
+      };
+    });
+  }, []);
+
+  const upsertDiagram = useCallback((diagram: Diagram) => {
+    setResult(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        diagrams: [
+          ...prev.diagrams.filter(d => d.name !== diagram.name),
+          diagram,
+        ],
+      };
+    });
+  }, []);
+
+  const updateAnalysis = useCallback((analysis: AnalysisResult) => {
+    setResult(prev => {
+      if (!prev) return prev;
+      return { ...prev, analysis };
+    });
+  }, []);
+
+  const updateFileTree = useCallback((fileTree: string[]) => {
+    setResult(prev => {
+      if (!prev) return prev;
+      return { ...prev, fileTree };
+    });
+  }, []);
 
   return {
     analyze,
+    resume,
     reset,
+    upsertPatch,
+    upsertDiagram,
+    updateAnalysis,
+    updateFileTree,
+    sessionId,
     isLoading,
     progress,
     statusMessage,
+    sessionStatus,
     result,
     error,
   };

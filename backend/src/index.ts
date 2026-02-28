@@ -7,10 +7,20 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import analysisRoutes from './routes/analysis.js';
 import logger from './utils/logger.js';
+import { setTraceProcessors, setTracingDisabled } from '@openai/agents';
 
 dotenv.config();
 
-const app = express();
+// Disable OpenAI Agents tracing by default to avoid noisy export failures in restricted networks.
+// Set HIPAA_AGENT_ENABLE_TRACING=1 to re-enable.
+const enableTracing = process.env.HIPAA_AGENT_ENABLE_TRACING === '1' || process.env.HIPAA_AGENT_ENABLE_TRACING === 'true';
+if (!enableTracing) {
+  setTracingDisabled(true);
+  setTraceProcessors([]);
+  logger.info('OpenAI Agents tracing disabled');
+}
+
+const app: express.Express = express();
 const PORT = process.env.PORT || 3001;
 
 // Middleware

@@ -1,18 +1,33 @@
 import * as Tooltip from '@radix-ui/react-tooltip';
-import { Shield, Github } from 'lucide-react';
+import { Folder, Github, History } from 'lucide-react';
+
+const LOGO_URL = 'https://cdn.prod.website-files.com/66acb95cb4494fc16ceefb5c/66acbab0f2243846b02e7c79_Logo.svg';
 
 interface HeaderProps {
   repoUrl: string;
   onRepoUrlChange: (url: string) => void;
   onAnalyze: () => void;
+  onOpenSessions: () => void;
   isLoading: boolean;
   hasResults: boolean;
+}
+
+function isLikelyLocalRepoInput(value: string): boolean {
+  const raw = (value || '').trim();
+  if (!raw) return false;
+  if (raw.startsWith('file:')) return true;
+  if (raw === '~' || raw.startsWith('~/')) return true;
+  if (raw.startsWith('./') || raw.startsWith('../')) return true;
+  if (raw.startsWith('/')) return true;
+  if (/^[A-Za-z]:[\\/]/.test(raw)) return true;
+  return false;
 }
 
 export function Header({
   repoUrl,
   onRepoUrlChange,
   onAnalyze,
+  onOpenSessions,
   isLoading,
 }: HeaderProps) {
   const handleSubmit = (e: React.FormEvent) => {
@@ -20,28 +35,51 @@ export function Header({
     onAnalyze();
   };
 
+  const isLocal = isLikelyLocalRepoInput(repoUrl);
+
   return (
     <Tooltip.Provider>
       <header className="app-header">
         <div className="header-brand">
-          <Shield size={24} className="brand-icon" />
-          <div>
-            <h1>HIPAA Compliance Agent</h1>
-            <p>AI-powered security analysis</p>
-          </div>
+          <img src={LOGO_URL} alt="Logo" className="brand-logo" />
         </div>
 
         <form className="repo-input" onSubmit={handleSubmit}>
           <div className="input-wrapper">
-            <Github size={16} className="input-icon" />
+            {isLocal ? (
+              <Folder size={16} className="input-icon" />
+            ) : (
+              <Github size={16} className="input-icon" />
+            )}
             <input
               type="text"
               value={repoUrl}
               onChange={(e) => onRepoUrlChange(e.target.value)}
-              placeholder="github.com/owner/repo or owner/repo"
+              placeholder="github.com/owner/repo, owner/repo, or /path/to/folder"
+              title="Paste a GitHub repo (owner/repo) or a local folder path (e.g., /Users/you/project)"
               disabled={isLoading}
             />
           </div>
+
+          <Tooltip.Root>
+            <Tooltip.Trigger asChild>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={onOpenSessions}
+                disabled={isLoading}
+              >
+                <History size={16} />
+                Sessions
+              </button>
+            </Tooltip.Trigger>
+            <Tooltip.Portal>
+              <Tooltip.Content className="tooltip-content" sideOffset={5}>
+                Restore a previous scan
+              </Tooltip.Content>
+            </Tooltip.Portal>
+          </Tooltip.Root>
+
           <Tooltip.Root>
             <Tooltip.Trigger asChild>
               <button type="submit" className="btn btn-primary" disabled={isLoading || !repoUrl.trim()}>

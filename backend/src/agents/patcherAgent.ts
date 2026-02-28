@@ -1,11 +1,12 @@
 /**
  * Security Patcher Agent
- * Generates patches for HIPAA compliance issues
+ * Generates patches for HIPAA compliance issues using OpenAI Agents SDK
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import { Agent, run } from '@openai/agents';
 import { Finding, AnalysisResult } from './analyzerAgent.js';
 import { RepoFile } from '../services/githubService.js';
+import logger from '../utils/logger.js';
 
 export interface Patch {
   file: string;
@@ -22,7 +23,7 @@ export interface PatchResult {
   patches: Patch[];
 }
 
-const SYSTEM_PROMPT = `You are a security engineer specializing in HIPAA compliance remediation.
+const SYSTEM_INSTRUCTIONS = `You are a security engineer specializing in HIPAA compliance remediation.
 
 Your task is to generate secure code patches that fix HIPAA compliance violations.
 
@@ -41,12 +42,14 @@ Common fixes:
 - Add input validation`;
 
 export class PatcherAgent {
-  private client: Anthropic;
-  private model: string;
+  private agent: Agent;
 
-  constructor(model: string = 'claude-sonnet-4-20250514') {
-    this.client = new Anthropic();
-    this.model = model;
+  constructor(model: string = 'gpt-4o') {
+    this.agent = new Agent({
+      name: 'HIPAA Patcher',
+      instructions: SYSTEM_INSTRUCTIONS,
+      model,
+    });
   }
 
   async generatePatch(
@@ -65,7 +68,15 @@ export class PatcherAgent {
     }
 
     const findingsText = findings
-      .map(f => `- Line ${f.line}: ${f.issue} (${f.severity})`)
+      .map(f => {
+        const lines = (f.locations || [])
+          .map(l => l.line)
+          .filter(n => Number.isFinite(n) && n > 0)
+          .slice(0, 8)
+          .join(', ');
+        const more = (f.locations?.length || 0) > 8 ? ` (+${(f.locations?.length || 0) - 8} more)` : '';
+        return `- ${f.title} [${f.severity}] at lines ${lines}${more}: ${f.issue}`;
+      })
       .join('\n');
 
     const prompt = `Fix the HIPAA compliance issues in this file:
@@ -96,16 +107,18 @@ EXPLANATION:
 [brief explanation of security improvements]`;
 
     try {
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 8192,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: prompt }],
-      });
-
-      const text = response.content[0].type === 'text' ? response.content[0].text : '';
+      logger.debug({ file: filePath }, 'Generating patch with OpenAI');
+      const result = await run(this.agent, prompt);
+      logger.debug({ file: filePath, hasOutput: !!result.finalOutput }, 'Patch generated');
+      const text = typeof result.finalOutput === 'string' ? result.finalOutput : String(result.finalOutput || '');
       return this.parsePatchResponse(filePath, content, text);
-    } catch (error) {
+    } catch (error: any) {
+      logger.error({
+        err: error,
+        file: filePath,
+        message: error?.message,
+        stack: error?.stack
+      }, 'Patch generation failed');
       return {
         file: filePath,
         originalContent: content,
@@ -163,13 +176,18 @@ EXPLANATION:
     }
 
     const patches: Patch[] = [];
+    const total = findingsByFile.size;
+    let processed = 0;
 
     for (const [filePath, findings] of findingsByFile) {
       const file = files.find(f => f.path === filePath);
       if (!file) continue;
 
+      processed++;
+      logger.info({ file: filePath, progress: `${processed}/${total}` }, 'Generating patch');
       const patch = await this.generatePatch(filePath, file.content, findings);
       patches.push(patch);
+      logger.info({ file: filePath, success: !!patch.patchedContent }, 'Patch complete');
     }
 
     return {

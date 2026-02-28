@@ -18,6 +18,7 @@
     "@radix-ui/react-toggle-group": "^1.1.11",
     "@radix-ui/react-tooltip": "^1.2.8",
     "lucide-react": "^0.447.0",
+    "monaco-editor": "^0.52.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

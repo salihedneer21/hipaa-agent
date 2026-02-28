@@ -1,17 +1,27 @@
 /**
  * HIPAA Analyzer Agent
- * Analyzes source code for HIPAA compliance violations using Claude
+ * Analyzes source code for HIPAA compliance violations using OpenAI Agents SDK
  */
-import { RepoFile } from '../services/githubService.js';
+export interface FindingLocation {
+    line: number;
+    endLine?: number;
+    code?: string;
+}
 export interface Finding {
+    id: string;
     ruleId: string;
     ruleName: string;
     severity: 'critical' | 'high' | 'medium' | 'low';
     file: string;
-    line: number;
-    code?: string;
+    title: string;
     issue: string;
     remediation: string;
+    locations: FindingLocation[];
+    whyItMatters?: string;
+    howItHappens?: string;
+    properFix?: string;
+    hipaaReference?: string;
+    confidence?: 'high' | 'medium' | 'low';
 }
 export interface AnalysisResult {
     totalFiles: number;
@@ -26,14 +36,18 @@ export interface AnalysisResult {
     allFindings: Finding[];
 }
 export declare class AnalyzerAgent {
-    private client;
-    private model;
+    private agent;
     constructor(model?: string);
-    private quickScan;
     private isCriticalFile;
-    analyzeFile(filePath: string, content: string): Promise<Finding[]>;
+    private quickSignal;
+    private formatCodeWithLineNumbers;
+    private normalizeForKey;
+    private computeFindingId;
+    analyzeFile(filePath: string, content: string, options?: {
+        force?: boolean;
+    }): Promise<Finding[]>;
     private deepAnalyze;
     private parseFindings;
-    analyzeRepository(files: RepoFile[]): Promise<AnalysisResult>;
+    buildAnalysisResult(totalFiles: number, analyzedFiles: number, allFindings: Finding[]): AnalysisResult;
 }
 export declare const analyzerAgent: AnalyzerAgent;

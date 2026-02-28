@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { CheckCircle, Clock, Copy, GitCommit, X } from 'lucide-react';
 import type { SessionMeta } from '../types';
+import { apiFetch } from '../api';
 
 function formatRepo(repoUrl: string): string {
   const raw = repoUrl || '';
@@ -48,7 +49,7 @@ export function SessionsDialog({
       setIsLoading(true);
       setLoadError(null);
       try {
-        const response = await fetch('/api/sessions', { signal: controller.signal });
+        const response = await apiFetch('/api/sessions', { signal: controller.signal });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Failed to load sessions');
         if (!cancelled) setSessions(Array.isArray(data.sessions) ? data.sessions : []);

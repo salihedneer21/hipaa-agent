@@ -4,6 +4,8 @@
  */
 import { Router } from 'express';
 import path from 'path';
+import fs from 'fs/promises';
+import { spawn } from 'child_process';
 import { GitHubService } from '../services/githubService.js';
 import { AnalyzerAgent } from '../agents/analyzerAgent.js';
 import { PatcherAgent } from '../agents/patcherAgent.js';
@@ -12,11 +14,12 @@ import { diagramFixAgent } from '../agents/diagramFixAgent.js';
 import { patchSetAgent } from '../agents/patchSetAgent.js';
 import logger from '../utils/logger.js';
 import { sessionStore } from '../services/sessionStore.js';
-import { getSessionRepoDir } from '../utils/storagePaths.js';
+import { getSessionDir, getSessionRepoDir } from '../utils/storagePaths.js';
 import { ANALYZABLE_EXTENSIONS, SKIP_DIRECTORIES } from '../knowledge/hipaaRules.js';
 const router = Router();
 // Store analysis sessions
 const sessions = new Map();
+const buildJobs = new Map();
 /**
  * POST /api/analyze
  * Start analysis of a GitHub repository (public repos - no token needed)
@@ -148,6 +151,7 @@ async function runAnalysis(sessionId, repoUrl) {
             readme: repoData.readme,
             fileTree: repoData.fileTree,
             analysis: analysisResult,
+            resolvedFindings: [],
             patches: [],
             diagrams,
         };
@@ -247,6 +251,192 @@ router.get('/sessions/:sessionId/file', async (req, res) => {
     }
     const content = await service.readFile(repoPath, filePath);
     res.json({ path: filePath, content, truncated: false });
+});
+function appendBuildLog(job, chunk) {
+    if (!chunk)
+        return;
+    job.logs += chunk;
+    const MAX = 220_000;
+    if (job.logs.length > MAX) {
+        job.logs = job.logs.slice(job.logs.length - MAX);
+        job.logsTruncated = true;
+    }
+}
+async function fileExists(filePath) {
+    try {
+        await fs.stat(filePath);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+async function runCommand(job, command, args, cwd, envOverrides) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(command, args, {
+            cwd,
+            env: {
+                ...process.env,
+                ...(envOverrides || {}),
+                CI: '1',
+                npm_config_loglevel: 'notice',
+                npm_config_fund: 'false',
+                npm_config_audit: 'false',
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        child.stdout.on('data', (d) => appendBuildLog(job, d.toString()));
+        child.stderr.on('data', (d) => appendBuildLog(job, d.toString()));
+        child.on('error', (err) => reject(err));
+        child.on('close', (code) => resolve(typeof code === 'number' ? code : 0));
+    });
+}
+async function runBuildJob(buildId, sessionId, options) {
+    const job = buildJobs.get(buildId);
+    if (!job)
+        return;
+    job.status = 'running';
+    job.startedAt = new Date().toISOString();
+    job.message = 'Preparing build workspace…';
+    const repoPath = getSessionRepoDir(sessionId);
+    const workspaceRoot = path.join(getSessionDir(sessionId), 'build');
+    const workspace = path.join(workspaceRoot, buildId);
+    try {
+        await fs.rm(workspace, { recursive: true, force: true });
+        await fs.mkdir(workspace, { recursive: true });
+        // Copy snapshot into workspace so installs/builds don't mutate the stored repo snapshot.
+        // Node.js >=16 supports fs.cp.
+        // @ts-ignore - types vary by TS/lib target
+        await fs.cp(repoPath, workspace, { recursive: true });
+        const packageJsonPath = path.join(workspace, 'package.json');
+        if (!(await fileExists(packageJsonPath))) {
+            throw new Error('No package.json found in repo snapshot (build runner currently supports Node/npm projects only).');
+        }
+        let scripts = {};
+        try {
+            const pkgRaw = await fs.readFile(packageJsonPath, 'utf-8');
+            const pkg = JSON.parse(pkgRaw);
+            scripts = (pkg && typeof pkg === 'object' && pkg.scripts && typeof pkg.scripts === 'object') ? pkg.scripts : {};
+        }
+        catch {
+            scripts = {};
+        }
+        const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+        if (options.install) {
+            job.message = 'Installing dependencies…';
+            const hasPackageLock = await fileExists(path.join(workspace, 'package-lock.json'));
+            const installArgsBase = hasPackageLock ? ['ci'] : ['install'];
+            if (options.ignoreScripts)
+                installArgsBase.push('--ignore-scripts');
+            // Prefer ci when lock exists; fallback to install if ci fails.
+            let code = await runCommand(job, npmCmd, installArgsBase, workspace, options.env);
+            if (code !== 0 && hasPackageLock) {
+                appendBuildLog(job, `\n[hipaa-agent] npm ci failed (exit ${code}); retrying with npm install…\n`);
+                const retryArgs = ['install'];
+                if (options.ignoreScripts)
+                    retryArgs.push('--ignore-scripts');
+                code = await runCommand(job, npmCmd, retryArgs, workspace, options.env);
+            }
+            if (code !== 0)
+                throw new Error(`Dependency install failed (exit ${code}).`);
+        }
+        const shouldBuild = options.kind === 'build' || options.kind === 'build+test';
+        const shouldTest = options.kind === 'test' || options.kind === 'build+test';
+        if (shouldBuild) {
+            const buildScript = scripts.build ? 'build' : null;
+            if (buildScript) {
+                job.message = `Running ${buildScript}…`;
+                const code = await runCommand(job, npmCmd, ['run', buildScript], workspace, options.env);
+                if (code !== 0)
+                    throw new Error(`${buildScript} failed (exit ${code}).`);
+            }
+            else {
+                appendBuildLog(job, `\n[hipaa-agent] No build script found; skipping build.\n`);
+            }
+        }
+        if (shouldTest) {
+            if (scripts.test) {
+                job.message = 'Running tests…';
+                const code = await runCommand(job, npmCmd, ['test'], workspace, options.env);
+                if (code !== 0)
+                    throw new Error(`Tests failed (exit ${code}).`);
+            }
+            else {
+                appendBuildLog(job, `\n[hipaa-agent] No test script found; skipping tests.\n`);
+            }
+        }
+        job.status = 'complete';
+        job.message = 'Build checks passed';
+        job.exitCode = 0;
+        job.completedAt = new Date().toISOString();
+    }
+    catch (err) {
+        job.status = 'error';
+        const message = err?.message || 'Build failed';
+        job.message = message;
+        job.exitCode = 1;
+        appendBuildLog(job, `\n[hipaa-agent] Build failed: ${message}\n`);
+        job.completedAt = new Date().toISOString();
+    }
+}
+/**
+ * POST /api/sessions/:sessionId/build
+ * Run best-effort build/test checks in an isolated workspace (manual, optional)
+ */
+router.post('/sessions/:sessionId/build', async (req, res) => {
+    const { sessionId } = req.params;
+    const kindRaw = String(req.body?.kind || 'build+test');
+    const kind = (kindRaw === 'build' || kindRaw === 'test' || kindRaw === 'build+test') ? kindRaw : 'build+test';
+    const install = req.body?.install === false ? false : true;
+    const ignoreScripts = req.body?.ignoreScripts === true;
+    const envRaw = req.body?.env;
+    let env;
+    if (envRaw && typeof envRaw === 'object' && !Array.isArray(envRaw)) {
+        const out = {};
+        for (const [k, v] of Object.entries(envRaw)) {
+            const key = String(k || '').trim();
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
+                continue;
+            const value = typeof v === 'string' ? v : (v == null ? '' : String(v));
+            // Prevent extremely large env payloads.
+            if (value.length > 10_000)
+                continue;
+            out[key] = value;
+        }
+        if (Object.keys(out).length > 0)
+            env = out;
+    }
+    const stored = await sessionStore.loadSessionResult(sessionId);
+    if (!stored) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+    }
+    const buildId = `build_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const job = {
+        buildId,
+        sessionId,
+        status: 'pending',
+        message: 'Queued…',
+        createdAt: new Date().toISOString(),
+        logs: '',
+        logsTruncated: false,
+    };
+    buildJobs.set(buildId, job);
+    res.json({ buildId });
+    runBuildJob(buildId, sessionId, { kind, install, ignoreScripts, env });
+});
+/**
+ * GET /api/sessions/:sessionId/build/:buildId
+ * Poll build status/logs
+ */
+router.get('/sessions/:sessionId/build/:buildId', async (req, res) => {
+    const { sessionId, buildId } = req.params;
+    const job = buildJobs.get(buildId);
+    if (!job || job.sessionId !== sessionId) {
+        res.status(404).json({ error: 'Build not found' });
+        return;
+    }
+    res.json(job);
 });
 /**
  * POST /api/sessions/:sessionId/diagrams/finding
@@ -376,13 +566,90 @@ function isAnalyzableFile(filePath) {
     const ext = path.extname(filePath);
     return ANALYZABLE_EXTENSIONS.includes(ext) || filePath.endsWith('.env');
 }
+function toPosixPath(filePath) {
+    return String(filePath || '').replace(/\\/g, '/');
+}
+function stripCodeComments(code) {
+    return code
+        // block comments
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        // line comments
+        .replace(/\/\/.*$/gm, '');
+}
+function extractImportSpecifiers(code) {
+    const cleaned = stripCodeComments(code);
+    const specs = new Set();
+    const patterns = [
+        /\bfrom\s*['"]([^'"]+)['"]/g, // import/export ... from "x"
+        /\bimport\s*['"]([^'"]+)['"]/g, // import "x"
+        /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // import("x")
+        /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // require("x")
+        /\bexport\s+\*\s+from\s*['"]([^'"]+)['"]/g,
+        /\bexport\s+\{[^}]*\}\s+from\s*['"]([^'"]+)['"]/g,
+    ];
+    for (const re of patterns) {
+        let match;
+        while ((match = re.exec(cleaned))) {
+            const spec = match[1];
+            if (typeof spec === 'string' && spec.trim())
+                specs.add(spec.trim());
+        }
+    }
+    return Array.from(specs);
+}
+function resolveRelativeImportCandidates(importerPath, specifier) {
+    const importer = toPosixPath(importerPath);
+    const baseDir = path.posix.dirname(importer);
+    const joined = path.posix.normalize(path.posix.join(baseDir, specifier));
+    // Prevent escaping the repo root.
+    if (joined.startsWith('..'))
+        return [];
+    const hasExt = Boolean(path.posix.extname(joined));
+    const exts = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.yml', '.yaml'];
+    const candidates = [];
+    if (hasExt) {
+        candidates.push(joined);
+    }
+    else {
+        for (const ext of exts)
+            candidates.push(joined + ext);
+        for (const ext of exts)
+            candidates.push(path.posix.join(joined, `index${ext}`));
+    }
+    // De-dupe while preserving order
+    const seen = new Set();
+    const out = [];
+    for (const c of candidates) {
+        const v = toPosixPath(c);
+        if (seen.has(v))
+            continue;
+        seen.add(v);
+        out.push(v);
+    }
+    return out;
+}
+function normalizeFindingKey(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[`"'’“”]/g, '')
+        // Remove explicit line references that often create duplicate keys.
+        .replace(/\b(lines?|ln)\s*\d+(\s*-\s*\d+)?\b/g, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 200);
+}
+function findingStatusKey(f) {
+    return `${toPosixPath(f.file)}|${String(f.ruleId || '')}|${normalizeFindingKey(f.title)}`;
+}
 /**
  * POST /api/sessions/:sessionId/patchset
  * Generate a multi-file patch plan for a file's findings (proposal only)
  */
 router.post('/sessions/:sessionId/patchset', async (req, res) => {
     const { sessionId } = req.params;
-    const rootFile = String(req.body?.file || '');
+    const rootFile = toPosixPath(String(req.body?.file || ''));
+    const requestedFindingId = String(req.body?.findingId || '').trim();
     if (!rootFile) {
         res.status(400).json({ error: 'file is required' });
         return;
@@ -396,11 +663,20 @@ router.post('/sessions/:sessionId/patchset', async (req, res) => {
         res.status(404).json({ error: 'Session not found' });
         return;
     }
-    if (!stored.fileTree.includes(rootFile)) {
+    const storedFileTreeSet = new Set(stored.fileTree.map(toPosixPath));
+    if (!storedFileTreeSet.has(rootFile)) {
         res.status(404).json({ error: 'File not found in session' });
         return;
     }
-    const findings = stored.analysis.allFindings.filter(f => f.file === rootFile);
+    let findings = stored.analysis.allFindings.filter(f => f.file === rootFile);
+    if (requestedFindingId) {
+        const match = findings.find(f => f.id === requestedFindingId);
+        if (!match) {
+            res.status(404).json({ error: 'Finding not found in this file' });
+            return;
+        }
+        findings = [match];
+    }
     if (findings.length === 0) {
         res.status(400).json({ error: 'No findings for this file' });
         return;
@@ -437,7 +713,7 @@ router.post('/sessions/:sessionId/patchset', async (req, res) => {
         let hasRoot = false;
         for (const op of ops) {
             const action = String(op.action || '').toLowerCase();
-            const p = String(op.path || '');
+            const p = toPosixPath(String(op.path || ''));
             const content = typeof op.content === 'string' ? op.content : '';
             if (action !== 'modify' && action !== 'add')
                 errors.push(`Invalid action for ${p || '(missing path)'}: ${action}`);
@@ -445,8 +721,6 @@ router.post('/sessions/:sessionId/patchset', async (req, res) => {
                 errors.push(`Invalid path: ${p}`);
             if (isInSkippedDirectory(p))
                 errors.push(`Path in skipped directory: ${p}`);
-            if (!isAnalyzableFile(p))
-                errors.push(`Non-analyzable file type: ${p}`);
             if (content.length < 1)
                 errors.push(`Empty content for ${p}`);
             if (content.length > 250_000)
@@ -456,9 +730,9 @@ router.post('/sessions/:sessionId/patchset', async (req, res) => {
             if (seen.has(p))
                 errors.push(`Duplicate operation for path: ${p}`);
             seen.add(p);
-            if (action === 'modify' && !stored.fileTree.includes(p))
+            if (action === 'modify' && !storedFileTreeSet.has(p))
                 errors.push(`Modify references missing file: ${p}`);
-            if (action === 'add' && stored.fileTree.includes(p))
+            if (action === 'add' && storedFileTreeSet.has(p))
                 errors.push(`Add references existing file: ${p}`);
             if (p === rootFile && action === 'modify')
                 hasRoot = true;
@@ -562,7 +836,11 @@ router.post('/sessions/:sessionId/patchset', async (req, res) => {
 router.post('/sessions/:sessionId/patchset/apply', async (req, res) => {
     const { sessionId } = req.params;
     const patchSetId = String(req.body?.patchSetId || '');
-    const files = Array.isArray(req.body?.files) ? req.body.files.map((f) => String(f || '')).filter(Boolean) : null;
+    const files = Array.isArray(req.body?.files)
+        ? req.body.files
+            .map((f) => toPosixPath(String(f || '')))
+            .filter((f) => Boolean(f))
+        : null;
     if (!patchSetId) {
         res.status(400).json({ error: 'patchSetId is required' });
         return;
@@ -577,15 +855,20 @@ router.post('/sessions/:sessionId/patchset/apply', async (req, res) => {
         res.status(404).json({ error: 'Patchset not found' });
         return;
     }
+    const storedFileTreeSet = new Set(stored.fileTree.map(toPosixPath));
+    const candidatesByFile = new Map();
+    for (const c of candidates)
+        candidatesByFile.set(toPosixPath(c.file), c);
     const toApply = files
-        ? candidates.filter(p => files.includes(p.file))
+        ? files.map(f => candidatesByFile.get(f)).filter((p) => Boolean(p))
         : candidates;
     if (toApply.length === 0) {
         res.status(400).json({ error: 'No matching patches selected' });
         return;
     }
     for (const f of toApply.map(p => p.file)) {
-        if (!isSafeRelativePath(f)) {
+        const fp = toPosixPath(f);
+        if (!isSafeRelativePath(fp)) {
             res.status(400).json({ error: `Invalid file path in selection: ${f}` });
             return;
         }
@@ -600,7 +883,7 @@ router.post('/sessions/:sessionId/patchset/apply', async (req, res) => {
     }
     const nextFileTree = [...stored.fileTree];
     for (const file of appliedFiles) {
-        if (!nextFileTree.includes(file) && isAnalyzableFile(file) && !isInSkippedDirectory(file)) {
+        if (!nextFileTree.includes(file) && !isInSkippedDirectory(file) && isSafeRelativePath(toPosixPath(file))) {
             nextFileTree.push(file);
         }
     }
@@ -629,7 +912,7 @@ router.post('/sessions/:sessionId/patchset/apply', async (req, res) => {
  */
 router.post('/sessions/:sessionId/patch', async (req, res) => {
     const { sessionId } = req.params;
-    const filePath = String(req.body?.file || '');
+    const filePath = toPosixPath(String(req.body?.file || ''));
     const apply = Boolean(req.body?.apply);
     if (!filePath) {
         res.status(400).json({ error: 'file is required' });
@@ -644,7 +927,8 @@ router.post('/sessions/:sessionId/patch', async (req, res) => {
         res.status(404).json({ error: 'Session not found' });
         return;
     }
-    if (!stored.fileTree.includes(filePath)) {
+    const storedFileTreeSet = new Set(stored.fileTree.map(toPosixPath));
+    if (!storedFileTreeSet.has(filePath)) {
         res.status(404).json({ error: 'File not found in session' });
         return;
     }
@@ -660,6 +944,11 @@ router.post('/sessions/:sessionId/patch', async (req, res) => {
     const patch = await patcher.generatePatch(filePath, originalContent, findings);
     if (!patch.patchedContent) {
         res.status(500).json({ error: patch.error || 'Failed to generate patch' });
+        return;
+    }
+    // Minimal validation: block placeholder "fixes" and rely on real builds for correctness.
+    if (/hypothetical|placeholder/i.test(patch.patchedContent)) {
+        res.status(422).json({ error: 'Generated patch failed validation', details: ['Patch contains placeholder language (e.g., "hypothetical").'] });
         return;
     }
     const now = new Date().toISOString();
@@ -695,7 +984,7 @@ router.post('/sessions/:sessionId/patch', async (req, res) => {
  */
 router.post('/sessions/:sessionId/patch/apply', async (req, res) => {
     const { sessionId } = req.params;
-    const filePath = String(req.body?.file || '');
+    const filePath = toPosixPath(String(req.body?.file || ''));
     if (!filePath) {
         res.status(400).json({ error: 'file is required' });
         return;
@@ -712,6 +1001,11 @@ router.post('/sessions/:sessionId/patch/apply', async (req, res) => {
     const existing = stored.patches.find(p => p.file === filePath);
     if (!existing) {
         res.status(400).json({ error: 'No generated patch for this file' });
+        return;
+    }
+    // Minimal validation: prevent applying placeholder "fixes".
+    if (/hypothetical|placeholder/i.test(existing.patchedContent || '')) {
+        res.status(422).json({ error: 'Patch failed validation', details: ['Patch contains placeholder language (e.g., "hypothetical").'] });
         return;
     }
     const service = new GitHubService();
@@ -736,12 +1030,65 @@ router.post('/sessions/:sessionId/patch/apply', async (req, res) => {
     res.json({ patch: updatedPatch });
 });
 /**
+ * POST /api/sessions/:sessionId/patch/revert
+ * Revert an applied patch back to its original content (best-effort)
+ */
+router.post('/sessions/:sessionId/patch/revert', async (req, res) => {
+    const { sessionId } = req.params;
+    const filePath = toPosixPath(String(req.body?.file || ''));
+    if (!filePath) {
+        res.status(400).json({ error: 'file is required' });
+        return;
+    }
+    if (filePath.includes('..') || path.isAbsolute(filePath)) {
+        res.status(400).json({ error: 'Invalid file path' });
+        return;
+    }
+    const stored = await sessionStore.loadSessionResult(sessionId);
+    if (!stored) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+    }
+    const existing = stored.patches.find(p => p.file === filePath);
+    if (!existing || !existing.appliedAt) {
+        res.status(400).json({ error: 'No applied patch found for this file' });
+        return;
+    }
+    const service = new GitHubService();
+    const repoPath = getSessionRepoDir(sessionId);
+    const action = existing.action || 'modify';
+    let nextFileTree = stored.fileTree;
+    if (action === 'add') {
+        // Remove added file entirely.
+        await fs.rm(path.join(repoPath, filePath), { force: true });
+        nextFileTree = stored.fileTree.filter(f => f !== filePath);
+    }
+    else {
+        await service.writeFile(repoPath, filePath, existing.originalContent);
+    }
+    const updatedPatch = { ...existing, appliedAt: undefined };
+    const updated = {
+        ...stored,
+        fileTree: nextFileTree,
+        patches: [
+            ...stored.patches.filter(p => p.file !== filePath),
+            updatedPatch,
+        ],
+    };
+    await sessionStore.saveCompleteSession(updated);
+    const mem = sessions.get(sessionId);
+    if (mem && mem.status === 'complete') {
+        mem.result = updated;
+    }
+    res.json({ patch: updatedPatch, fileTree: nextFileTree });
+});
+/**
  * POST /api/sessions/:sessionId/verify
  * Re-analyze a single file in the stored repo clone and refresh findings (best-effort)
  */
 router.post('/sessions/:sessionId/verify', async (req, res) => {
     const { sessionId } = req.params;
-    const filePath = String(req.body?.file || '');
+    const filePath = toPosixPath(String(req.body?.file || ''));
     if (!filePath) {
         res.status(400).json({ error: 'file is required' });
         return;
@@ -764,22 +1111,46 @@ router.post('/sessions/:sessionId/verify', async (req, res) => {
     const content = await service.readFile(repoPath, filePath);
     try {
         const analyzer = new AnalyzerAgent();
+        const prevFindingsForFile = stored.analysis.allFindings.filter(f => toPosixPath(f.file) === filePath);
         const newFindings = await analyzer.analyzeFile(filePath, content, { force: true });
         const updatedAllFindings = [
-            ...stored.analysis.allFindings.filter(f => f.file !== filePath),
+            ...stored.analysis.allFindings.filter(f => toPosixPath(f.file) !== filePath),
             ...newFindings,
         ];
         const updatedAnalysis = analyzer.buildAnalysisResult(stored.analysis.totalFiles, stored.analysis.analyzedFiles, updatedAllFindings);
+        // Track resolved findings so the UI can show "Done" vs "Not done".
+        const now = new Date().toISOString();
+        const hasAppliedPatchForFile = (stored.patches || []).some(p => toPosixPath(p.file) === filePath && Boolean(p.appliedAt));
+        const openKeys = new Set(newFindings.map(f => findingStatusKey(f)));
+        const existingResolved = Array.isArray(stored.resolvedFindings)
+            ? stored.resolvedFindings
+            : [];
+        // Remove any previously resolved findings that have re-appeared.
+        const filteredResolved = existingResolved.filter(r => !openKeys.has(findingStatusKey(r)));
+        const nextResolved = [...filteredResolved];
+        const resolvedKeys = new Set(nextResolved.map(r => findingStatusKey(r)));
+        if (hasAppliedPatchForFile) {
+            for (const oldFinding of prevFindingsForFile) {
+                const k = findingStatusKey(oldFinding);
+                if (openKeys.has(k))
+                    continue;
+                if (resolvedKeys.has(k))
+                    continue;
+                nextResolved.push({ ...oldFinding, resolvedAt: now });
+                resolvedKeys.add(k);
+            }
+        }
         const updated = {
             ...stored,
             analysis: updatedAnalysis,
+            resolvedFindings: nextResolved,
         };
         await sessionStore.saveCompleteSession(updated);
         const mem = sessions.get(sessionId);
         if (mem && mem.status === 'complete') {
             mem.result = updated;
         }
-        res.json({ analysis: updatedAnalysis, findings: newFindings });
+        res.json({ analysis: updatedAnalysis, findings: newFindings, resolvedFindings: nextResolved });
     }
     catch (error) {
         logger.error({ err: error, sessionId, filePath }, 'Verify failed');

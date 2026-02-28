@@ -4,7 +4,6 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import analysisRoutes from './routes/analysis.js';
 import logger from './utils/logger.js';
 import { setTraceProcessors, setTracingDisabled } from '@openai/agents';
 dotenv.config();
@@ -16,6 +15,8 @@ if (!enableTracing) {
     setTraceProcessors([]);
     logger.info('OpenAI Agents tracing disabled');
 }
+// Import routes AFTER tracing is configured, so agent modules don't initialize tracing exporters in restricted networks.
+const { default: analysisRoutes } = await import('./routes/analysis.js');
 const app = express();
 const PORT = process.env.PORT || 3001;
 // Middleware

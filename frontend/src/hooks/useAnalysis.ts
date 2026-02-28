@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import type { AnalysisResponse, AnalysisResult, Diagram, Patch, SessionStatus } from '../types';
+import type { AnalysisResponse, AnalysisResult, Diagram, Patch, ResolvedFinding, SessionStatus } from '../types';
+import { apiFetch } from '../api';
 
 const LAST_SESSION_ID_KEY = 'hipaa-agent:lastSessionId';
 
@@ -27,7 +28,7 @@ export function useAnalysis() {
 
   const pollStatus = useCallback(async (sessionId: string) => {
     try {
-      const response = await fetch(`/api/analyze/${sessionId}`);
+      const response = await apiFetch(`/api/analyze/${sessionId}`);
       if (!response.ok) {
         throw new Error('Failed to get analysis status');
       }
@@ -75,7 +76,7 @@ export function useAnalysis() {
     pollStatus(id);
   }, [clearPoll, pollStatus]);
 
-  const analyze = useCallback(async (repoUrl: string) => {
+  const analyze = useCallback(async (repoUrl: string, options?: { githubInstallationId?: number | null }) => {
     setIsLoading(true);
     setProgress(0);
     setStatusMessage('Starting analysis...');
@@ -85,10 +86,13 @@ export function useAnalysis() {
     clearPoll();
 
     try {
-      const response = await fetch('/api/analyze', {
+      const response = await apiFetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repoUrl }),
+        body: JSON.stringify({
+          repoUrl,
+          githubInstallationId: options?.githubInstallationId ?? undefined,
+        }),
       });
 
       if (!response.ok) {
@@ -170,6 +174,13 @@ export function useAnalysis() {
     });
   }, []);
 
+  const updateResolvedFindings = useCallback((resolvedFindings: ResolvedFinding[]) => {
+    setResult(prev => {
+      if (!prev) return prev;
+      return { ...prev, resolvedFindings };
+    });
+  }, []);
+
   return {
     analyze,
     resume,
@@ -178,6 +189,7 @@ export function useAnalysis() {
     upsertDiagram,
     updateAnalysis,
     updateFileTree,
+    updateResolvedFindings,
     sessionId,
     isLoading,
     progress,

@@ -8,6 +8,9 @@ interface HeaderProps {
   onRepoUrlChange: (url: string) => void;
   onAnalyze: () => void;
   onOpenSessions: () => void;
+  onOpenGitHub: () => void;
+  githubEnabled: boolean;
+  githubConnectedLabel?: string | null;
   isLoading: boolean;
   hasResults: boolean;
 }
@@ -28,6 +31,9 @@ export function Header({
   onRepoUrlChange,
   onAnalyze,
   onOpenSessions,
+  onOpenGitHub,
+  githubEnabled,
+  githubConnectedLabel,
   isLoading,
 }: HeaderProps) {
   const handleSubmit = (e: React.FormEvent) => {
@@ -76,6 +82,30 @@ export function Header({
             <Tooltip.Portal>
               <Tooltip.Content className="tooltip-content" sideOffset={5}>
                 Restore a previous scan
+              </Tooltip.Content>
+            </Tooltip.Portal>
+          </Tooltip.Root>
+
+          <Tooltip.Root>
+            <Tooltip.Trigger asChild>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={onOpenGitHub}
+                disabled={isLoading || !githubEnabled}
+              >
+                <Github size={16} />
+                GitHub
+                {githubConnectedLabel ? (
+                  <span className="github-pill" title={`Connected as ${githubConnectedLabel}`}>
+                    {githubConnectedLabel}
+                  </span>
+                ) : null}
+              </button>
+            </Tooltip.Trigger>
+            <Tooltip.Portal>
+              <Tooltip.Content className="tooltip-content" sideOffset={5}>
+                {githubEnabled ? (githubConnectedLabel ? 'Pick a private repo or create PRs' : 'Connect GitHub to scan private repos') : 'GitHub App not configured'}
               </Tooltip.Content>
             </Tooltip.Portal>
           </Tooltip.Root>

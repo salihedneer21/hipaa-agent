@@ -23,6 +23,10 @@ export interface Finding {
   confidence?: 'high' | 'medium' | 'low';
 }
 
+export interface ResolvedFinding extends Finding {
+  resolvedAt: string;
+}
+
 export interface AnalysisResult {
   totalFiles: number;
   analyzedFiles: number;
@@ -74,11 +78,13 @@ export interface AnalysisResponse {
   repoUrl: string;
   normalizedRepoUrl: string;
   commitHash?: string;
+  github?: { installationId: number; repoFullName: string } | undefined;
   createdAt: string;
   completedAt?: string;
   readme: string | null;
   fileTree: string[];
   analysis: AnalysisResult;
+  resolvedFindings?: ResolvedFinding[];
   patches: Patch[];
   diagrams: Diagram[];
   error?: string;

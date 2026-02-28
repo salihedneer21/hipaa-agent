@@ -16,6 +16,7 @@ Hard rules:
 - You MAY edit multiple files and you MAY add new files when needed.
 - If you add a local import, it must refer to an existing repo file OR a file you add in this patch plan.
 - Use relative imports for newly created local files (match the repo's import style).
+- Do NOT invent non-existent package subpaths; prefer imports already used in the repo.
 - Do not touch files in node_modules, dist, build, .git, or hidden directories.
 - Prefer using existing utilities/libraries already present in the repo; do not add new deps unless unavoidable.
 

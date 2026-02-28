@@ -159,10 +159,10 @@ export class AnalyzerAgent {
       .slice(0, 200);
   }
 
-  private computeFindingId(filePath: string, ruleId: string, title: string, remediation: string): string {
+  private computeFindingId(filePath: string, ruleId: string, title: string, issue: string): string {
     const hash = crypto
       .createHash('sha256')
-      .update(`${filePath}|${ruleId}|${this.normalizeForKey(title)}|${this.normalizeForKey(remediation)}`)
+      .update(`${filePath}|${ruleId}|${this.normalizeForKey(title)}|${this.normalizeForKey(issue)}`)
       .digest('hex');
     return `finding_${hash.slice(0, 16)}`;
   }
@@ -327,7 +327,7 @@ ${code}
       if (locations.length === 0) continue;
 
       findings.push({
-        id: this.computeFindingId(filePath, ruleId, title, remediation),
+        id: this.computeFindingId(filePath, ruleId, title, issue),
         ruleId,
         ruleName,
         severity,
@@ -384,11 +384,11 @@ ${code}
       target.confidence = target.confidence || incoming.confidence;
     };
 
-    // Merge duplicates the model might have returned. Prefer grouping by title/remediation instead of issue text
-    // (models often include variable names or line numbers in the issue field, causing noisy duplicates).
+    // Merge duplicates the model might have returned. Prefer grouping by title/issue instead of remediation
+    // (models often vary remediation phrasing).
     const merged = new Map<string, Finding>();
     for (const finding of findings) {
-      const key = `${finding.file}|${finding.ruleId}|${this.normalizeForKey(finding.title)}|${this.normalizeForKey(finding.remediation)}`;
+      const key = `${finding.file}|${finding.ruleId}|${this.normalizeForKey(finding.title)}|${this.normalizeForKey(finding.issue)}`;
       const existing = merged.get(key);
       if (!existing) {
         merged.set(key, { ...finding, locations: [...finding.locations] });
@@ -437,19 +437,57 @@ ${code}
   }
 
   buildAnalysisResult(totalFiles: number, analyzedFiles: number, allFindings: Finding[]): AnalysisResult {
+    // Extra safety: de-dupe by finding id across the whole repo (models can occasionally repeat identical findings).
+    const rank = (s: Finding['severity']): number => (s === 'critical' ? 4 : s === 'high' ? 3 : s === 'medium' ? 2 : 1);
+    const pickLongest = (a?: string, b?: string) => {
+      const aa = typeof a === 'string' ? a.trim() : '';
+      const bb = typeof b === 'string' ? b.trim() : '';
+      if (!aa) return bb || undefined;
+      if (!bb) return aa || undefined;
+      return (bb.length > aa.length ? bb : aa) || undefined;
+    };
+
+    const byId = new Map<string, Finding>();
+    for (const f of allFindings) {
+      const existing = byId.get(f.id);
+      if (!existing) {
+        byId.set(f.id, { ...f, locations: [...(f.locations || [])] });
+        continue;
+      }
+
+      const locKeys = new Set((existing.locations || []).map(l => `${l.line}:${l.endLine || l.line}`));
+      for (const loc of f.locations || []) {
+        const lk = `${loc.line}:${loc.endLine || loc.line}`;
+        if (locKeys.has(lk)) continue;
+        locKeys.add(lk);
+        existing.locations.push(loc);
+      }
+      existing.locations.sort((a, b) => a.line - b.line);
+
+      if (rank(f.severity) > rank(existing.severity)) existing.severity = f.severity;
+      existing.issue = pickLongest(existing.issue, f.issue) || existing.issue;
+      existing.remediation = pickLongest(existing.remediation, f.remediation) || existing.remediation;
+      existing.whyItMatters = pickLongest(existing.whyItMatters, f.whyItMatters);
+      existing.howItHappens = pickLongest(existing.howItHappens, f.howItHappens);
+      existing.properFix = pickLongest(existing.properFix, f.properFix);
+      existing.hipaaReference = pickLongest(existing.hipaaReference, f.hipaaReference);
+      existing.confidence = existing.confidence || f.confidence;
+    }
+
+    const dedupedAllFindings = Array.from(byId.values());
     const findingsBySeverity = {
-      critical: allFindings.filter(f => f.severity === 'critical'),
-      high: allFindings.filter(f => f.severity === 'high'),
-      medium: allFindings.filter(f => f.severity === 'medium'),
-      low: allFindings.filter(f => f.severity === 'low'),
+      critical: dedupedAllFindings.filter(f => f.severity === 'critical'),
+      high: dedupedAllFindings.filter(f => f.severity === 'high'),
+      medium: dedupedAllFindings.filter(f => f.severity === 'medium'),
+      low: dedupedAllFindings.filter(f => f.severity === 'low'),
     };
 
     return {
       totalFiles,
       analyzedFiles,
-      totalFindings: allFindings.length,
+      totalFindings: dedupedAllFindings.length,
       findingsBySeverity,
-      allFindings,
+      allFindings: dedupedAllFindings,
     };
   }
 }

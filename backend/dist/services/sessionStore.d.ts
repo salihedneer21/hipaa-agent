@@ -35,6 +35,9 @@ export interface StoredAnalysisFinding {
     hipaaReference?: string;
     confidence?: 'high' | 'medium' | 'low';
 }
+export interface StoredResolvedFinding extends StoredAnalysisFinding {
+    resolvedAt: string;
+}
 export interface StoredAnalysisResult {
     totalFiles: number;
     analyzedFiles: number;
@@ -76,6 +79,7 @@ export interface SessionResult {
     readme: string | null;
     fileTree: string[];
     analysis: StoredAnalysisResult;
+    resolvedFindings?: StoredResolvedFinding[];
     patches: StoredPatch[];
     diagrams: StoredDiagram[];
     error?: string;

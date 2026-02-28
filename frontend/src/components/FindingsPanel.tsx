@@ -14,13 +14,14 @@ import {
   Shield,
   Wrench,
 } from 'lucide-react';
-import type { Finding, Patch } from '../types';
+import type { Finding, ResolvedFinding } from '../types';
 
 interface FindingsPanelProps {
   findings: Finding[];
-  patches?: Patch[];
+  resolvedFindings?: ResolvedFinding[];
   selectedFile: string | null;
   onSelectFinding: (selection: { file: string; lines: number[] }) => void;
+  onFixFinding?: (findingId: string) => void;
   onViewDiagram?: (findingId: string) => void;
 }
 
@@ -34,13 +35,15 @@ const severityIcons = {
 function FindingCard({
   finding,
   onSelectFinding,
+  onFixFinding,
   onViewDiagram,
-  isPatched,
+  status,
 }: {
   finding: Finding;
   onSelectFinding: (selection: { file: string; lines: number[] }) => void;
+  onFixFinding?: (findingId: string) => void;
   onViewDiagram?: (findingId: string) => void;
-  isPatched: boolean;
+  status: 'open' | 'resolved';
 }) {
   const [isOpen, setIsOpen] = useState(false);
 
@@ -51,10 +54,21 @@ function FindingCard({
     return Array.from(new Set(all)).sort((a, b) => a - b);
   }, [finding.locations]);
 
-  const hasDetails = Boolean(finding.whyItMatters || finding.howItHappens || finding.properFix || finding.hipaaReference || onViewDiagram);
+  const isResolved = status === 'resolved';
+  const hasActions = Boolean((onFixFinding && !isResolved) || onViewDiagram);
+  const hasDetails = Boolean(
+    finding.whyItMatters ||
+    finding.howItHappens ||
+    finding.properFix ||
+    finding.hipaaReference ||
+    hasActions
+  );
+  const icon = isResolved
+    ? <CheckCircle size={14} className="severity-icon resolved" />
+    : severityIcons[finding.severity];
 
   return (
-    <div className={`finding-card ${finding.severity}`}>
+    <div className={`finding-card ${finding.severity} ${isResolved ? 'resolved' : ''}`}>
       <div
         className="finding-card-header"
         role="button"
@@ -65,13 +79,13 @@ function FindingCard({
         }}
         title="Open in editor"
       >
-        {severityIcons[finding.severity]}
+        {icon}
         <span className="finding-title">{finding.title || finding.ruleName || 'Security Issue'}</span>
         {finding.confidence && (
           <span className={`finding-confidence ${finding.confidence}`}>{finding.confidence}</span>
         )}
-        {isPatched && (
-          <span className="finding-patch-badge" title="A patch has been applied to this file (findings may be stale until re-verified)">
+        {isResolved && (
+          <span className="finding-patch-badge" title="This finding is marked as resolved after re-verification">
             Patched
           </span>
         )}
@@ -152,12 +166,20 @@ function FindingCard({
               </div>
             )}
 
-            {onViewDiagram && (
+            {((onFixFinding && !isResolved) || onViewDiagram) && (
               <div className="finding-diagram-actions">
-                <button className="btn btn-secondary btn-sm" onClick={() => onViewDiagram(finding.id)}>
-                  <Network size={14} />
-                  View Diagram
-                </button>
+                {onFixFinding && !isResolved && (
+                  <button className="btn btn-primary btn-sm" onClick={() => onFixFinding(finding.id)}>
+                    <Wrench size={14} />
+                    Suggest Fix
+                  </button>
+                )}
+                {onViewDiagram && (
+                  <button className="btn btn-secondary btn-sm" onClick={() => onViewDiagram(finding.id)}>
+                    <Network size={14} />
+                    View Diagram
+                  </button>
+                )}
               </div>
             )}
           </Collapsible.Content>
@@ -167,25 +189,21 @@ function FindingCard({
   );
 }
 
-export function FindingsPanel({ findings, patches = [], selectedFile, onSelectFinding, onViewDiagram }: FindingsPanelProps) {
-  const filtered = selectedFile ? findings.filter(f => f.file === selectedFile) : findings;
-
-  const appliedPatchFiles = useMemo(() => {
-    const set = new Set<string>();
-    for (const p of patches) {
-      if (p.appliedAt) set.add(p.file);
-    }
-    return set;
-  }, [patches]);
+export function FindingsPanel({ findings, resolvedFindings = [], selectedFile, onSelectFinding, onFixFinding, onViewDiagram }: FindingsPanelProps) {
+  const openFindings = selectedFile ? findings.filter(f => f.file === selectedFile) : findings;
+  const doneFindings = useMemo(() => {
+    const filtered = selectedFile ? resolvedFindings.filter(f => f.file === selectedFile) : resolvedFindings;
+    return [...filtered].sort((a, b) => (b.resolvedAt || '').localeCompare(a.resolvedAt || ''));
+  }, [resolvedFindings, selectedFile]);
 
   const groupedBySeverity = useMemo(() => ({
-    critical: filtered.filter(f => f.severity === 'critical'),
-    high: filtered.filter(f => f.severity === 'high'),
-    medium: filtered.filter(f => f.severity === 'medium'),
-    low: filtered.filter(f => f.severity === 'low'),
-  }), [filtered]);
+    critical: openFindings.filter(f => f.severity === 'critical'),
+    high: openFindings.filter(f => f.severity === 'high'),
+    medium: openFindings.filter(f => f.severity === 'medium'),
+    low: openFindings.filter(f => f.severity === 'low'),
+  }), [openFindings]);
 
-  if (filtered.length === 0) {
+  if (openFindings.length === 0 && doneFindings.length === 0) {
     return (
       <div className="findings-panel empty">
         <CheckCircle size={40} className="empty-icon" />
@@ -199,7 +217,7 @@ export function FindingsPanel({ findings, patches = [], selectedFile, onSelectFi
     <div className="findings-panel">
       <div className="findings-header">
         <h3>{selectedFile ? `Findings in ${selectedFile.split('/').pop()}` : 'All Findings'}</h3>
-        <p className="findings-count">{filtered.length} finding{filtered.length !== 1 ? 's' : ''}</p>
+        <p className="findings-count">{openFindings.length} open • {doneFindings.length} done</p>
         <div className="findings-summary">
           {groupedBySeverity.critical.length > 0 && (
             <span className="badge critical">{groupedBySeverity.critical.length} Critical</span>
@@ -219,17 +237,39 @@ export function FindingsPanel({ findings, patches = [], selectedFile, onSelectFi
       <ScrollArea.Root className="scroll-area-root" style={{ flex: 1 }}>
         <ScrollArea.Viewport className="scroll-area-viewport">
           <div className="findings-list">
-            {(['critical', 'high', 'medium', 'low'] as const).map(severity => (
-              groupedBySeverity[severity].map((finding) => (
-                <FindingCard
-                  key={finding.id}
-                  finding={finding}
-                  onSelectFinding={onSelectFinding}
-                  onViewDiagram={onViewDiagram}
-                  isPatched={appliedPatchFiles.has(finding.file)}
-                />
-              ))
-            ))}
+            {openFindings.length > 0 && (
+              <>
+                <div className="findings-section-title">Not done</div>
+                {(['critical', 'high', 'medium', 'low'] as const).map(severity => (
+                  groupedBySeverity[severity].map((finding) => (
+                    <FindingCard
+                      key={finding.id}
+                      finding={finding}
+                      onSelectFinding={onSelectFinding}
+                      onFixFinding={onFixFinding}
+                      onViewDiagram={onViewDiagram}
+                      status="open"
+                    />
+                  ))
+                ))}
+              </>
+            )}
+
+            {doneFindings.length > 0 && (
+              <>
+                <div className="findings-section-title done">Done</div>
+                {doneFindings.map((finding) => (
+                  <FindingCard
+                    key={finding.id}
+                    finding={finding}
+                    onSelectFinding={onSelectFinding}
+                    onFixFinding={onFixFinding}
+                    onViewDiagram={onViewDiagram}
+                    status="resolved"
+                  />
+                ))}
+              </>
+            )}
           </div>
         </ScrollArea.Viewport>
         <ScrollArea.Scrollbar className="scroll-area-scrollbar" orientation="vertical">

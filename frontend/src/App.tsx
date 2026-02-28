@@ -12,9 +12,26 @@ import { SessionsDialog } from './components/SessionsDialog';
 import { useAnalysis } from './hooks/useAnalysis';
 import { Eye, GitCompare, History, Shield, Search, Wrench, X } from 'lucide-react';
 import type { Diagram, Patch, SessionStatus } from './types';
+import { apiFetch } from './api';
 
 type ViewMode = 'current' | 'original' | 'diff';
 type PreviewIssue = NonNullable<SessionStatus['issuesPreview']>[number];
+
+type GitHubInstallation = {
+  installationId: number;
+  accountLogin?: string;
+  accountType?: 'User' | 'Organization';
+  repositorySelection?: 'all' | 'selected';
+};
+
+type GitHubRepoItem = {
+  id: number;
+  fullName: string;
+  name: string;
+  owner?: string;
+  private: boolean;
+  defaultBranch?: string;
+};
 
 // Dynamic progress messages based on stage
 const PROGRESS_MESSAGES: Record<string, string[]> = {
@@ -103,7 +120,7 @@ function SkeletonLoader({
       fetchAbortRef.current = controller;
       setIsPreviewLoading(true);
 
-      fetch(`/api/sessions/${sessionId}/file?path=${encodeURIComponent(wanted)}&maxBytes=8000`, { signal: controller.signal })
+      apiFetch(`/api/sessions/${sessionId}/file?path=${encodeURIComponent(wanted)}&maxBytes=8000`, { signal: controller.signal })
         .then(async (response) => {
           const data = await response.json();
           if (!response.ok) {
@@ -504,6 +521,15 @@ function DecoShapes() {
 
 function App() {
   const [repoUrl, setRepoUrl] = useState('');
+  const [githubDialogOpen, setGithubDialogOpen] = useState(false);
+  const [githubConfigured, setGithubConfigured] = useState(false);
+  const [githubInstallations, setGithubInstallations] = useState<GitHubInstallation[]>([]);
+  const [selectedGithubInstallationId, setSelectedGithubInstallationId] = useState<number | null>(null);
+  const [githubRepos, setGithubRepos] = useState<GitHubRepoItem[]>([]);
+  const [githubRepoSearch, setGithubRepoSearch] = useState('');
+  const [githubLoading, setGithubLoading] = useState(false);
+  const [githubError, setGithubError] = useState<string | null>(null);
+  const [githubCallbackInstallationId, setGithubCallbackInstallationId] = useState<number | null>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [selectedLines, setSelectedLines] = useState<number[]>([]);
   const [selectedDiagram, setSelectedDiagram] = useState<string | null>(null);
@@ -512,6 +538,7 @@ function App() {
   const [isFileLoading, setIsFileLoading] = useState(false);
   const [showErrorDetails, setShowErrorDetails] = useState(false);
   const [fixPromptOpen, setFixPromptOpen] = useState(false);
+  const [fixTargetFindingId, setFixTargetFindingId] = useState<string | null>(null);
   const [isGeneratingFix, setIsGeneratingFix] = useState(false);
   const [isApplyingFix, setIsApplyingFix] = useState(false);
   const [isVerifyingFix, setIsVerifyingFix] = useState(false);
@@ -521,6 +548,12 @@ function App() {
   const [patchReviewPatches, setPatchReviewPatches] = useState<Patch[]>([]);
   const [patchReviewSelectedFiles, setPatchReviewSelectedFiles] = useState<Record<string, boolean>>({});
   const [patchReviewActiveFile, setPatchReviewActiveFile] = useState<string | null>(null);
+  const [prDialogOpen, setPrDialogOpen] = useState(false);
+  const [prTitle, setPrTitle] = useState('');
+  const [prBody, setPrBody] = useState('');
+  const [isCreatingPr, setIsCreatingPr] = useState(false);
+  const [createdPr, setCreatedPr] = useState<{ number: number; html_url: string; branch?: string; base?: string } | null>(null);
+  const [prError, setPrError] = useState<string | null>(null);
   const [sessionsDialogOpen, setSessionsDialogOpen] = useState(false);
   const [findingDiagramOpen, setFindingDiagramOpen] = useState(false);
   const [findingDiagram, setFindingDiagram] = useState<Diagram | null>(null);
@@ -529,7 +562,7 @@ function App() {
   const [findingDiagramError, setFindingDiagramError] = useState<string | null>(null);
   const [isFindingDiagramLoading, setIsFindingDiagramLoading] = useState(false);
 
-  const { analyze, resume, upsertPatch, upsertDiagram, updateAnalysis, updateFileTree, sessionId, isLoading, progress, statusMessage, sessionStatus, result, error } = useAnalysis();
+  const { analyze, resume, upsertPatch, upsertDiagram, updateAnalysis, updateFileTree, updateResolvedFindings, sessionId, isLoading, progress, statusMessage, sessionStatus, result, error } = useAnalysis();
   const activeSessionId = result?.sessionId || sessionId;
 
   const errorSummary = useMemo(() => {
@@ -568,14 +601,144 @@ function App() {
     return null;
   }, [error]);
 
+  const githubConnectedLabel = useMemo(() => {
+    if (githubInstallations.length === 0) return null;
+    const selected = selectedGithubInstallationId
+      ? githubInstallations.find(i => i.installationId === selectedGithubInstallationId)
+      : githubInstallations[0];
+    return selected?.accountLogin || 'Connected';
+  }, [githubInstallations, selectedGithubInstallationId]);
+
+  function isLikelyLocalRepoInput(value: string): boolean {
+    const raw = (value || '').trim();
+    if (!raw) return false;
+    if (raw.startsWith('file:')) return true;
+    if (raw === '~' || raw.startsWith('~/')) return true;
+    if (raw.startsWith('./') || raw.startsWith('../')) return true;
+    if (raw.startsWith('/')) return true;
+    if (/^[A-Za-z]:[\\/]/.test(raw)) return true;
+    return false;
+  }
+
+  const refreshGitHubConfig = async () => {
+    try {
+      const response = await apiFetch('/api/github/config');
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to load GitHub config');
+      setGithubConfigured(Boolean(data.configured));
+    } catch {
+      setGithubConfigured(false);
+    }
+  };
+
+  const refreshGitHubInstallations = async () => {
+    try {
+      const response = await apiFetch('/api/github/installations');
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to load GitHub installations');
+      const installations: GitHubInstallation[] = Array.isArray(data.installations)
+        ? data.installations.map((i: any) => ({
+          installationId: Number(i.installationId),
+          accountLogin: typeof i.accountLogin === 'string' ? i.accountLogin : undefined,
+          accountType: (i.accountType === 'Organization' || i.accountType === 'User') ? i.accountType : undefined,
+          repositorySelection: (i.repositorySelection === 'all' || i.repositorySelection === 'selected') ? i.repositorySelection : undefined,
+        })).filter((i: GitHubInstallation) => Number.isFinite(i.installationId) && i.installationId > 0)
+        : [];
+      setGithubInstallations(installations);
+      if (!selectedGithubInstallationId && installations.length > 0) {
+        setSelectedGithubInstallationId(installations[0]!.installationId);
+      }
+    } catch (e) {
+      setGithubInstallations([]);
+    }
+  };
+
+  const refreshGitHubRepos = async (installationId: number) => {
+    if (!installationId) return;
+    setGithubLoading(true);
+    setGithubError(null);
+    try {
+      const response = await apiFetch(`/api/github/repos?installationId=${encodeURIComponent(String(installationId))}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to load repositories');
+      const repos: GitHubRepoItem[] = Array.isArray(data.repos)
+        ? data.repos.map((r: any) => ({
+          id: Number(r.id),
+          fullName: String(r.fullName || ''),
+          name: String(r.name || ''),
+          owner: typeof r.owner === 'string' ? r.owner : undefined,
+          private: Boolean(r.private),
+          defaultBranch: typeof r.defaultBranch === 'string' ? r.defaultBranch : undefined,
+        })).filter((r: GitHubRepoItem) => Number.isFinite(r.id) && r.id > 0 && Boolean(r.fullName))
+        : [];
+      setGithubRepos(repos);
+    } catch (e) {
+      setGithubRepos([]);
+      setGithubError(e instanceof Error ? e.message : 'Failed to load repositories');
+    } finally {
+      setGithubLoading(false);
+    }
+  };
+
+  const connectGitHub = async () => {
+    setGithubLoading(true);
+    setGithubError(null);
+    try {
+      const redirect = `${window.location.pathname}${window.location.search || ''}`;
+      const response = await apiFetch(`/api/github/install-url?redirect=${encodeURIComponent(redirect)}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to start GitHub connect');
+      if (!data.url) throw new Error('Missing GitHub install URL');
+      window.location.href = String(data.url);
+    } catch (e) {
+      setGithubError(e instanceof Error ? e.message : 'Failed to connect GitHub');
+      setGithubLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const iidRaw = params.get('github_installation_id');
+    if (iidRaw) {
+      const iid = Number(iidRaw);
+      if (Number.isFinite(iid) && iid > 0) setGithubCallbackInstallationId(iid);
+      params.delete('github_installation_id');
+      const next = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}${window.location.hash || ''}`;
+      window.history.replaceState({}, '', next);
+      setGithubDialogOpen(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshGitHubConfig();
+    refreshGitHubInstallations();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!githubDialogOpen) return;
+    if (!selectedGithubInstallationId) return;
+    refreshGitHubRepos(selectedGithubInstallationId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [githubDialogOpen, selectedGithubInstallationId]);
+
+  useEffect(() => {
+    if (!githubCallbackInstallationId) return;
+    const exists = githubInstallations.some(i => i.installationId === githubCallbackInstallationId);
+    if (exists) setSelectedGithubInstallationId(githubCallbackInstallationId);
+  }, [githubCallbackInstallationId, githubInstallations]);
+
   const handleAnalyze = () => {
     if (repoUrl.trim()) {
       setSelectedFile(null);
       setSelectedLines([]);
       setSelectedDiagram(null);
       setFixPromptOpen(false);
+      setFixTargetFindingId(null);
       setShowErrorDetails(false);
-      analyze(repoUrl.trim());
+      analyze(repoUrl.trim(), {
+        githubInstallationId: isLikelyLocalRepoInput(repoUrl) ? null : selectedGithubInstallationId,
+      });
     }
   };
 
@@ -584,6 +747,7 @@ function App() {
     setSelectedLines([]);
     setSelectedDiagram(null);
     setFixPromptOpen(false);
+    setFixTargetFindingId(null);
     setViewMode('current');
     setVerifyStatus(null);
   };
@@ -593,6 +757,7 @@ function App() {
     setSelectedLines(selection.lines);
     setSelectedDiagram(null);
     setFixPromptOpen(false);
+    setFixTargetFindingId(null);
     setViewMode('current');
     setVerifyStatus(null);
   };
@@ -602,6 +767,7 @@ function App() {
     setSelectedFile(null);
     setSelectedLines([]);
     setFixPromptOpen(false);
+    setFixTargetFindingId(null);
     setViewMode('current');
     setVerifyStatus(null);
   };
@@ -642,7 +808,7 @@ function App() {
     setFindingDiagram(null);
     setIsFindingDiagramLoading(true);
     try {
-      const response = await fetch(`/api/sessions/${activeSessionId}/diagrams/finding`, {
+      const response = await apiFetch(`/api/sessions/${activeSessionId}/diagrams/finding`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ findingId }),
@@ -672,7 +838,7 @@ function App() {
 
       setIsFileLoading(true);
       try {
-        const response = await fetch(`/api/sessions/${activeSessionId}/file?path=${encodeURIComponent(selectedFile)}`);
+        const response = await apiFetch(`/api/sessions/${activeSessionId}/file?path=${encodeURIComponent(selectedFile)}`);
         const data = await response.json();
         if (!cancelled) {
           setSelectedFileContent(data.content || '');
@@ -702,14 +868,7 @@ function App() {
 
     const selection: Record<string, boolean> = {};
     for (const p of patches) {
-      const action = p.action || 'modify';
-      selection[p.file] = Boolean(!p.appliedAt && action !== 'add');
-    }
-
-    // If everything defaulted to false (e.g. only "add" ops), select the focused file if present.
-    if (Object.values(selection).every(v => !v)) {
-      const preferred = focusFile && selection[focusFile] !== undefined ? focusFile : patches[0]?.file;
-      if (preferred) selection[preferred] = true;
+      selection[p.file] = Boolean(!p.appliedAt);
     }
 
     setPatchReviewSelectedFiles(selection);
@@ -730,10 +889,13 @@ function App() {
     if (!activeSessionId || !selectedFile) return;
     setIsGeneratingFix(true);
     try {
-      const response = await fetch(`/api/sessions/${activeSessionId}/patchset`, {
+      const payload: Record<string, unknown> = { file: selectedFile };
+      if (fixTargetFindingId) payload.findingId = fixTargetFindingId;
+
+      const response = await apiFetch(`/api/sessions/${activeSessionId}/patchset`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: selectedFile }),
+        body: JSON.stringify(payload),
       });
       const data = await response.json();
       if (!response.ok) {
@@ -747,6 +909,7 @@ function App() {
 
       patches.forEach(upsertPatch);
       setFixPromptOpen(false);
+      setFixTargetFindingId(null);
       setViewMode('diff');
       openPatchReview(patchSetId, patches, selectedFile);
     } catch (e) {
@@ -756,11 +919,27 @@ function App() {
     }
   };
 
+  const handleFixFinding = (findingId: string) => {
+    if (!result) return;
+    const finding = result.analysis.allFindings.find(f => f.id === findingId);
+    if (!finding) return;
+
+    const lines = Array.from(new Set((finding.locations || []).map(l => l.line).filter(n => Number.isFinite(n) && n > 0))).sort((a, b) => a - b);
+    setSelectedFile(finding.file);
+    setSelectedLines(lines);
+    setSelectedDiagram(null);
+    setViewMode('current');
+    setVerifyStatus(null);
+
+    setFixTargetFindingId(findingId);
+    setFixPromptOpen(true);
+  };
+
   const applySelectedFixes = async () => {
     if (!activeSessionId || !patchReviewPatchSetId) return;
     setIsApplyingFix(true);
     setVerifyStatus(null);
-    let verifyPath: string | null = null;
+    const filesWithFindingsBefore = new Set((result?.analysis?.allFindings || []).map(f => f.file));
     try {
       const selected = Object.entries(patchReviewSelectedFiles)
         .filter(([, checked]) => checked)
@@ -774,13 +953,7 @@ function App() {
         throw new Error('No selected changes to apply');
       }
 
-      if (selectedFile && filesToApply.includes(selectedFile)) {
-        verifyPath = selectedFile;
-      } else if (patchReviewActiveFile && filesToApply.includes(patchReviewActiveFile)) {
-        verifyPath = patchReviewActiveFile;
-      }
-
-      const response = await fetch(`/api/sessions/${activeSessionId}/patchset/apply`, {
+      const response = await apiFetch(`/api/sessions/${activeSessionId}/patchset/apply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ patchSetId: patchReviewPatchSetId, files: filesToApply }),
@@ -801,16 +974,18 @@ function App() {
         if (patchForActive?.patchedContent) setSelectedFileContent(patchForActive.patchedContent);
       }
 
-      setViewMode('current');
+      setViewMode('diff');
       setPatchReviewOpen(false);
       setPatchReviewPatchSetId(null);
       setPatchReviewPatches([]);
       setPatchReviewSelectedFiles({});
       setPatchReviewActiveFile(null);
 
-      if (verifyPath) {
-        await verifyFile(verifyPath);
+      const filesToVerify = Array.from(new Set(filesToApply.filter(f => filesWithFindingsBefore.has(f))));
+      if (filesToVerify.length > 0) {
+        await verifyFiles(filesToVerify);
       }
+
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Failed to apply fix plan');
     } finally {
@@ -824,7 +999,7 @@ function App() {
     setIsApplyingFix(true);
     setVerifyStatus(null);
     try {
-      const response = await fetch(`/api/sessions/${activeSessionId}/patch/apply`, {
+      const response = await apiFetch(`/api/sessions/${activeSessionId}/patch/apply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ file: selectedFile }),
@@ -834,8 +1009,8 @@ function App() {
 
       upsertPatch(data.patch as Patch);
       if (data.patch?.patchedContent) setSelectedFileContent(data.patch.patchedContent);
-      setViewMode('current');
-      await verifyFile(selectedFile);
+      setViewMode('diff');
+      await verifyFiles([selectedFile]);
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Failed to apply patch');
     } finally {
@@ -843,30 +1018,196 @@ function App() {
     }
   };
 
-  const verifyFile = async (filePath: string) => {
-    if (!activeSessionId) return;
-    setIsVerifyingFix(true);
+  const revertFix = async () => {
+    if (!activeSessionId || !selectedFile) return;
+    if (!selectedPatch?.appliedAt) return;
+
+    const ok = window.confirm(`Revert applied fix for ${selectedFile}? This will restore the previous content in the session snapshot.`);
+    if (!ok) return;
+
+    setIsApplyingFix(true);
+    setVerifyStatus(null);
     try {
-      const verifyResponse = await fetch(`/api/sessions/${activeSessionId}/verify`, {
+      const response = await apiFetch(`/api/sessions/${activeSessionId}/patch/revert`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: filePath }),
+        body: JSON.stringify({ file: selectedFile }),
       });
-      const verifyData = await verifyResponse.json();
-      if (!verifyResponse.ok) throw new Error(verifyData.error || 'Verification failed');
-      if (verifyData.analysis) updateAnalysis(verifyData.analysis);
-      const remaining = Array.isArray(verifyData.findings) ? verifyData.findings.length : null;
-      if (remaining === 0) {
-        setVerifyStatus({ kind: 'ok', message: 'Verified: no findings remain in this file.' });
-      } else if (typeof remaining === 'number') {
-        setVerifyStatus({ kind: 'warn', message: `Fix applied, but ${remaining} finding${remaining === 1 ? '' : 's'} still detected.` });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to revert patch');
+
+      if (data.patch) upsertPatch(data.patch as Patch);
+      if (Array.isArray(data.fileTree)) updateFileTree(data.fileTree);
+
+      if (selectedPatch.action === 'add') {
+        // File no longer exists.
+        setSelectedFile(null);
+        setSelectedFileContent('');
       } else {
-        setVerifyStatus({ kind: 'ok', message: 'Fix applied and verified.' });
+        setSelectedFileContent((data.patch?.originalContent as string) || '');
+        setViewMode('current');
+        await verifyFiles([selectedFile]);
       }
     } catch (e) {
-      setVerifyStatus({ kind: 'error', message: e instanceof Error ? e.message : 'Verification failed' });
+      alert(e instanceof Error ? e.message : 'Failed to revert patch');
+    } finally {
+      setIsApplyingFix(false);
+    }
+  };
+
+  const verifyFiles = async (filePaths: string[]) => {
+    if (!activeSessionId) return;
+    const unique = Array.from(new Set((filePaths || []).map(p => (p || '').trim()).filter(Boolean)));
+    if (unique.length === 0) return;
+
+    setIsVerifyingFix(true);
+    try {
+      let verified = 0;
+      let remainingTotal = 0;
+      const errors: string[] = [];
+
+      for (const filePath of unique) {
+        try {
+          const verifyResponse = await apiFetch(`/api/sessions/${activeSessionId}/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: filePath }),
+          });
+          const verifyData = await verifyResponse.json();
+          if (!verifyResponse.ok) throw new Error(verifyData.error || 'Verification failed');
+          if (verifyData.analysis) updateAnalysis(verifyData.analysis);
+          if (Array.isArray(verifyData.resolvedFindings)) updateResolvedFindings(verifyData.resolvedFindings);
+          const remaining = Array.isArray(verifyData.findings) ? verifyData.findings.length : 0;
+          remainingTotal += remaining;
+          verified++;
+        } catch (e) {
+          errors.push(`${filePath}: ${e instanceof Error ? e.message : 'Verification failed'}`);
+        }
+      }
+
+      if (errors.length > 0) {
+        const first = errors[0] || 'Verification failed';
+        setVerifyStatus({
+          kind: 'error',
+          message: errors.length === 1 ? first : `Verification failed for ${errors.length}/${unique.length} file(s). First: ${first}`,
+        });
+        return;
+      }
+
+      if (remainingTotal === 0) {
+        setVerifyStatus({ kind: 'ok', message: verified === 1 ? 'Verified: no findings remain in this file.' : `Verified ${verified} files: no findings remain.` });
+      } else {
+        setVerifyStatus({ kind: 'warn', message: verified === 1 ? `Fix applied, but ${remainingTotal} finding${remainingTotal === 1 ? '' : 's'} still detected.` : `Verified ${verified} files: ${remainingTotal} finding${remainingTotal === 1 ? '' : 's'} still detected.` });
+      }
     } finally {
       setIsVerifyingFix(false);
+    }
+  };
+
+  const hasAppliedPatches = useMemo(() => {
+    return (result?.patches || []).some(p => Boolean(p.appliedAt));
+  }, [result?.patches]);
+
+  const sessionRepoFullName = useMemo(() => {
+    if (result?.github?.repoFullName) return result.github.repoFullName;
+    const normalized = result?.normalizedRepoUrl || '';
+    try {
+      const u = new URL(normalized);
+      if (u.hostname !== 'github.com') return null;
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (parts.length < 2) return null;
+      const owner = parts[0]!;
+      const repo = parts[1]!.replace(/\.git$/i, '');
+      if (!owner || !repo) return null;
+      return `${owner}/${repo}`;
+    } catch {
+      return null;
+    }
+  }, [result?.github?.repoFullName, result?.normalizedRepoUrl]);
+
+  const prInstallationId = useMemo(() => {
+    const fromSession = result?.github?.installationId;
+    if (typeof fromSession === 'number' && Number.isFinite(fromSession) && fromSession > 0) return fromSession;
+    if (typeof selectedGithubInstallationId === 'number' && Number.isFinite(selectedGithubInstallationId) && selectedGithubInstallationId > 0) return selectedGithubInstallationId;
+    return null;
+  }, [result?.github?.installationId, selectedGithubInstallationId]);
+
+  const canCreatePr = useMemo(() => {
+    if (!activeSessionId) return false;
+    if (!githubConfigured) return false;
+    if (!hasAppliedPatches) return false;
+    if (!sessionRepoFullName) return false;
+    if (!prInstallationId) return false;
+    return true;
+  }, [activeSessionId, githubConfigured, hasAppliedPatches, prInstallationId, sessionRepoFullName]);
+
+  const buildDefaultPrBody = () => {
+    const applied = (result?.patches || []).filter(p => Boolean(p.appliedAt));
+    const resolvedCount = Array.isArray(result?.resolvedFindings) ? result!.resolvedFindings!.length : 0;
+    const lines: string[] = [];
+    lines.push('## Summary');
+    lines.push('');
+    lines.push(`- Applied patches: ${applied.length}`);
+    if (resolvedCount) lines.push(`- Resolved findings (verified): ${resolvedCount}`);
+    lines.push('');
+    lines.push('## Changes');
+    lines.push('');
+    for (const p of applied.slice(0, 30)) {
+      lines.push(`- ${p.file}${p.explanation ? ` — ${p.explanation}` : ''}`);
+    }
+    if (applied.length > 30) lines.push(`- …and ${applied.length - 30} more`);
+    lines.push('');
+    lines.push('## Notes');
+    lines.push('');
+    lines.push('- Please run the project build/tests before merging.');
+    lines.push('- Generated by HIPAA Agent.');
+    lines.push('');
+    return lines.join('\n');
+  };
+
+  const openCreatePrDialog = () => {
+    setCreatedPr(null);
+    setPrError(null);
+    const defaultTitle = sessionRepoFullName ? `HIPAA Agent: fixes for ${sessionRepoFullName}` : 'HIPAA Agent: security fixes';
+    setPrTitle((t) => t || defaultTitle);
+    setPrBody((b) => b || buildDefaultPrBody());
+    setPrDialogOpen(true);
+  };
+
+  const createPullRequest = async () => {
+    if (!activeSessionId) return;
+    if (!sessionRepoFullName) return;
+    if (!prInstallationId) return;
+    setIsCreatingPr(true);
+    setPrError(null);
+    setCreatedPr(null);
+    try {
+      const response = await apiFetch(`/api/sessions/${activeSessionId}/github/pr`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: prTitle,
+          body: prBody,
+          installationId: prInstallationId,
+          repoFullName: sessionRepoFullName,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to create PR');
+      if (data?.pr?.html_url) {
+        setCreatedPr({
+          number: Number(data.pr.number),
+          html_url: String(data.pr.html_url),
+          branch: typeof data.branch === 'string' ? data.branch : undefined,
+          base: typeof data.base === 'string' ? data.base : undefined,
+        });
+      } else {
+        throw new Error('PR created, but response was missing pr.html_url');
+      }
+    } catch (e) {
+      setPrError(e instanceof Error ? e.message : 'Failed to create PR');
+    } finally {
+      setIsCreatingPr(false);
     }
   };
 
@@ -887,6 +1228,14 @@ function App() {
     return patchReviewPatches.filter(p => selected.has(p.file) && !p.appliedAt).length;
   }, [patchReviewPatches, patchReviewSelectedFiles]);
 
+  const patchReviewUnselectedAdds = useMemo(() => {
+    const selected = patchReviewSelectedFiles;
+    return patchReviewPatches
+      .filter(p => (p.action || 'modify') === 'add' && !p.appliedAt)
+      .filter(p => !selected[p.file])
+      .map(p => p.file);
+  }, [patchReviewPatches, patchReviewSelectedFiles]);
+
   return (
     <div className="app">
       <Header
@@ -894,6 +1243,9 @@ function App() {
         onRepoUrlChange={setRepoUrl}
         onAnalyze={handleAnalyze}
         onOpenSessions={() => setSessionsDialogOpen(true)}
+        onOpenGitHub={() => setGithubDialogOpen(true)}
+        githubEnabled={githubConfigured}
+        githubConnectedLabel={githubConnectedLabel}
         isLoading={isLoading}
         hasResults={!!result}
       />
@@ -970,6 +1322,17 @@ function App() {
                   {result.patches.length} patch{result.patches.length !== 1 ? 'es' : ''} generated
                 </p>
               )}
+              <div className="summary-actions">
+                <button
+                  className="btn btn-secondary btn-sm"
+                  type="button"
+                  onClick={openCreatePrDialog}
+                  disabled={!canCreatePr}
+                  title={canCreatePr ? 'Create a PR with the applied fixes' : 'Connect GitHub and apply at least one fix to enable PR creation'}
+                >
+                  Create PR
+                </button>
+              </div>
             </div>
           </aside>
 
@@ -992,22 +1355,37 @@ function App() {
                 <div className="editor-header">
                   <span className="file-path">{selectedFile}</span>
                   <div className="editor-actions">
-                    {fileHasFindings && (!selectedPatch || !!selectedPatch.appliedAt) && !fixPromptOpen && (
+                    {fileHasFindings && !fixPromptOpen && (
                       <button
                         className="btn btn-secondary btn-sm"
                         disabled={isFileLoading || isGeneratingFix}
-                        onClick={() => setFixPromptOpen(true)}
+                        onClick={() => {
+                          setFixTargetFindingId(null);
+                          setFixPromptOpen(true);
+                        }}
                         title="Generate a suggested fix plan (review before applying)"
                       >
                         <Wrench size={14} />
-                        {selectedPatch?.appliedAt ? 'Generate Next Fix' : 'Generate Fix'}
+                        {selectedPatch?.appliedAt ? 'Generate Next Fix' : selectedPatch ? 'Regenerate Fix' : 'Generate Fix'}
                       </button>
                     )}
 
                     {fixPromptOpen && (
                       <div className="fix-prompt">
-                        <span className="fix-prompt-text">Generate an AI fix plan? (may touch multiple files)</span>
-                        <button className="btn btn-secondary btn-sm" onClick={() => setFixPromptOpen(false)} disabled={isGeneratingFix}>
+                        <span className="fix-prompt-text">
+                          {fixTargetFindingId
+                            ? 'Generate an AI fix plan for this finding? (may touch multiple files)'
+                            : 'Generate an AI fix plan for this file? (may touch multiple files)'}
+                          {selectedPatch && !selectedPatch.appliedAt ? ' This replaces the previous plan.' : ''}
+                        </span>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => {
+                            setFixPromptOpen(false);
+                            setFixTargetFindingId(null);
+                          }}
+                          disabled={isGeneratingFix}
+                        >
                           Cancel
                         </button>
                         <button className="btn btn-primary btn-sm" onClick={generateFix} disabled={isGeneratingFix}>
@@ -1041,6 +1419,17 @@ function App() {
                       </div>
                     )}
 
+                    {selectedPatch?.appliedAt && (
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={revertFix}
+                        disabled={isApplyingFix || isVerifyingFix}
+                        title="Revert this file back to its pre-fix content (session snapshot only)"
+                      >
+                        Revert
+                      </button>
+                    )}
+
                     {selectedPatch && (
                       <ToggleGroup.Root
                         className="toggle-group"
@@ -1052,12 +1441,10 @@ function App() {
                           <Eye size={14} />
                           Current
                         </ToggleGroup.Item>
-                        {selectedPatch.appliedAt && (
-                          <ToggleGroup.Item className="toggle-item" value="original">
-                            <History size={14} />
-                            Original
-                          </ToggleGroup.Item>
-                        )}
+                        <ToggleGroup.Item className="toggle-item" value="original">
+                          <History size={14} />
+                          Original
+                        </ToggleGroup.Item>
                         <ToggleGroup.Item className="toggle-item" value="diff">
                           <GitCompare size={14} />
                           Diff
@@ -1094,9 +1481,10 @@ function App() {
           <aside className="findings-sidebar">
             <FindingsPanel
               findings={result.analysis?.allFindings || []}
-              patches={result.patches || []}
+              resolvedFindings={result.resolvedFindings || []}
               selectedFile={selectedFile}
               onSelectFinding={handleSelectFinding}
+              onFixFinding={handleFixFinding}
               onViewDiagram={viewFindingDiagram}
             />
           </aside>
@@ -1193,6 +1581,11 @@ function App() {
                   <div className="patch-review-footer">
                     <div className="patch-review-summary">
                       <strong>{patchReviewSelectedCount}</strong> selected to apply
+                      {patchReviewUnselectedAdds.length > 0 && (
+                        <div className="patch-review-warning">
+                          Warning: you unselected {patchReviewUnselectedAdds.length} new file{patchReviewUnselectedAdds.length === 1 ? '' : 's'}. This may break imports or runtime behavior.
+                        </div>
+                      )}
                     </div>
                     <div className="patch-review-actions">
                       <button className="btn btn-secondary btn-sm" onClick={() => setPatchReviewOpen(false)} disabled={isApplyingFix}>
@@ -1266,6 +1659,252 @@ function App() {
                   <span className="spinner" />
                   Preparing…
                 </div>
+              )}
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root
+        open={githubDialogOpen}
+        onOpenChange={(open) => {
+          setGithubDialogOpen(open);
+          if (open) {
+            setGithubError(null);
+          }
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content github-dialog">
+            <div className="dialog-header">
+              <Dialog.Title className="dialog-title">GitHub</Dialog.Title>
+              <Dialog.Close className="dialog-close" aria-label="Close">
+                <X size={16} />
+              </Dialog.Close>
+            </div>
+
+            <div className="dialog-body github-body">
+              {!githubConfigured ? (
+                <div className="dialog-error">
+                  <strong>GitHub App is not configured.</strong>
+                  <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
+                    Set <code>GITHUB_APP_SLUG</code>, <code>GITHUB_APP_ID</code>, <code>GITHUB_APP_PRIVATE_KEY</code> (or <code>GITHUB_APP_PRIVATE_KEY_PATH</code>),
+                    and <code>HIPAA_AGENT_FRONTEND_URL</code> on the backend.
+                  </div>
+                </div>
+              ) : githubInstallations.length === 0 ? (
+                <div className="github-empty">
+                  <div className="github-empty-title">Connect GitHub to scan private repos and create PRs.</div>
+                  {githubError && (
+                    <div className="dialog-error" style={{ marginTop: 12 }}>
+                      <strong>Error:</strong> {githubError}
+                    </div>
+                  )}
+                  <div style={{ marginTop: 14 }}>
+                    <button className="btn btn-primary" type="button" onClick={connectGitHub} disabled={githubLoading}>
+                      {githubLoading ? (
+                        <>
+                          <span className="spinner" />
+                          Redirecting…
+                        </>
+                      ) : (
+                        'Connect GitHub'
+                      )}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="github-controls">
+                    <label className="github-select">
+                      <span>Installation</span>
+                      <select
+                        value={selectedGithubInstallationId || githubInstallations[0]?.installationId || ''}
+                        onChange={(e) => {
+                          const n = Number(e.target.value);
+                          if (Number.isFinite(n) && n > 0) setSelectedGithubInstallationId(n);
+                        }}
+                        disabled={githubLoading}
+                      >
+                        {githubInstallations.map((i) => (
+                          <option key={i.installationId} value={i.installationId}>
+                            {i.accountLogin ? `${i.accountLogin}${i.accountType ? ` (${i.accountType})` : ''}` : `Installation ${i.installationId}`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <div className="github-controls-actions">
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        type="button"
+                        onClick={() => selectedGithubInstallationId && refreshGitHubRepos(selectedGithubInstallationId)}
+                        disabled={githubLoading || !selectedGithubInstallationId}
+                      >
+                        Refresh
+                      </button>
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        type="button"
+                        onClick={connectGitHub}
+                        disabled={githubLoading}
+                        title="Install the GitHub App on another account or organization"
+                      >
+                        Add org/account
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="github-search">
+                    <Search size={16} className="github-search-icon" />
+                    <input
+                      type="text"
+                      value={githubRepoSearch}
+                      onChange={(e) => setGithubRepoSearch(e.target.value)}
+                      placeholder="Search repos…"
+                      disabled={githubLoading}
+                    />
+                  </div>
+
+                  {githubError && (
+                    <div className="dialog-error" style={{ marginBottom: 12 }}>
+                      <strong>Error:</strong> {githubError}
+                    </div>
+                  )}
+
+                  {githubLoading ? (
+                    <div className="dialog-loading">
+                      <span className="spinner" />
+                      Loading repositories…
+                    </div>
+                  ) : (
+                    <div className="github-repo-list">
+                      {githubRepos
+                        .filter(r => {
+                          const q = githubRepoSearch.trim().toLowerCase();
+                          if (!q) return true;
+                          return r.fullName.toLowerCase().includes(q);
+                        })
+                        .slice(0, 400)
+                        .map((r) => (
+                          <button
+                            key={r.id}
+                            type="button"
+                            className="github-repo-item"
+                            onClick={() => {
+                              setRepoUrl(r.fullName);
+                              setGithubDialogOpen(false);
+                            }}
+                            title={r.fullName}
+                          >
+                            <span className="github-repo-name">{r.fullName}</span>
+                            {r.private && <span className="github-repo-badge private">Private</span>}
+                          </button>
+                        ))}
+                      {githubRepos.length === 0 && (
+                        <div className="github-repo-empty">No repositories found for this installation.</div>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root
+        open={prDialogOpen}
+        onOpenChange={(open) => {
+          setPrDialogOpen(open);
+          if (!open) {
+            setPrError(null);
+            setCreatedPr(null);
+          }
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content pr-dialog">
+            <div className="dialog-header">
+              <Dialog.Title className="dialog-title">Create Pull Request</Dialog.Title>
+              <Dialog.Close className="dialog-close" aria-label="Close">
+                <X size={16} />
+              </Dialog.Close>
+            </div>
+
+            <div className="dialog-body pr-body">
+              {!canCreatePr ? (
+                <div className="dialog-error">
+                  <strong>PR creation isn’t available yet.</strong>
+                  <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
+                    Connect GitHub, analyze a GitHub repo, and apply at least one fix.
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {prError && (
+                    <div className="dialog-error">
+                      <strong>Error:</strong> {prError}
+                    </div>
+                  )}
+
+                  {createdPr && (
+                    <div className="pr-success">
+                      <strong>PR created:</strong>{' '}
+                      <a href={createdPr.html_url} target="_blank" rel="noreferrer">
+                        #{createdPr.number}
+                      </a>
+                      {createdPr.branch && <span className="pr-meta">Branch: {createdPr.branch}</span>}
+                      {createdPr.base && <span className="pr-meta">Base: {createdPr.base}</span>}
+                    </div>
+                  )}
+
+                  <div className="pr-field">
+                    <label>Title</label>
+                    <input
+                      type="text"
+                      value={prTitle}
+                      onChange={(e) => setPrTitle(e.target.value)}
+                      placeholder="PR title"
+                      disabled={isCreatingPr}
+                    />
+                  </div>
+
+                  <div className="pr-field">
+                    <label>Body</label>
+                    <textarea
+                      value={prBody}
+                      onChange={(e) => setPrBody(e.target.value)}
+                      rows={10}
+                      placeholder="Describe the changes…"
+                      disabled={isCreatingPr}
+                    />
+                  </div>
+
+                  <div className="pr-actions">
+                    <button className="btn btn-secondary btn-sm" type="button" onClick={() => setPrDialogOpen(false)} disabled={isCreatingPr}>
+                      Close
+                    </button>
+                    <button
+                      className="btn btn-primary btn-sm"
+                      type="button"
+                      onClick={createPullRequest}
+                      disabled={isCreatingPr || !prTitle.trim()}
+                      title="Creates a branch, commits the applied session changes, pushes, and opens a PR"
+                    >
+                      {isCreatingPr ? (
+                        <>
+                          <span className="spinner" />
+                          Creating…
+                        </>
+                      ) : (
+                        'Create PR'
+                      )}
+                    </button>
+                  </div>
+                </>
               )}
             </div>
           </Dialog.Content>

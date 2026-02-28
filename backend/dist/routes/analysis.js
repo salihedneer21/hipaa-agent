@@ -7,28 +7,187 @@ import path from 'path';
 import fs from 'fs/promises';
 import { spawn } from 'child_process';
 import { GitHubService } from '../services/githubService.js';
+import { githubAppService } from '../services/githubAppService.js';
+import { githubInstallationsStore } from '../services/githubInstallationsStore.js';
 import { AnalyzerAgent } from '../agents/analyzerAgent.js';
 import { PatcherAgent } from '../agents/patcherAgent.js';
 import { diagramAgent } from '../agents/diagramAgent.js';
 import { diagramFixAgent } from '../agents/diagramFixAgent.js';
 import { patchSetAgent } from '../agents/patchSetAgent.js';
+import { researchBaaForProvider } from '../agents/baaResearchAgent.js';
 import logger from '../utils/logger.js';
 import { sessionStore } from '../services/sessionStore.js';
 import { getSessionDir, getSessionRepoDir } from '../utils/storagePaths.js';
 import { ANALYZABLE_EXTENSIONS, SKIP_DIRECTORIES } from '../knowledge/hipaaRules.js';
+import { detectThirdPartyServices, enrichWithLogo } from '../services/thirdPartyService.js';
 const router = Router();
+function getClientId(req) {
+    const raw = String(req.header('x-hipaa-client-id') || '').trim();
+    if (raw && /^[a-zA-Z0-9_-]{6,128}$/.test(raw))
+        return raw;
+    return 'default';
+}
+function sanitizeRedirectPath(input) {
+    const raw = (input || '').trim();
+    if (!raw || !raw.startsWith('/'))
+        return '/';
+    // Prevent open redirects to protocol-relative URLs or path traversal.
+    if (raw.startsWith('//'))
+        return '/';
+    if (raw.includes('..'))
+        return '/';
+    return raw;
+}
 // Store analysis sessions
 const sessions = new Map();
-const buildJobs = new Map();
+/**
+ * GET /api/github/config
+ * Lightweight config probe so the UI can decide whether to show GitHub App features.
+ */
+router.get('/github/config', async (_req, res) => {
+    res.json({
+        configured: githubAppService.isConfigured(),
+        appSlug: githubAppService.getAppSlugOrNull(),
+    });
+});
+/**
+ * GET /api/github/install-url?redirect=/...
+ * Creates a GitHub App installation URL with a signed state.
+ */
+router.get('/github/install-url', async (req, res) => {
+    if (!githubAppService.isConfigured()) {
+        res.status(501).json({ error: 'GitHub App is not configured on the server' });
+        return;
+    }
+    const clientId = getClientId(req);
+    const redirectPath = sanitizeRedirectPath(String(req.query.redirect || '/'));
+    try {
+        const url = githubAppService.createInstallUrl(clientId, redirectPath);
+        res.json({ url });
+    }
+    catch (e) {
+        res.status(500).json({ error: e?.message || 'Failed to create install URL' });
+    }
+});
+/**
+ * GET /api/github/callback
+ * GitHub App setup callback (set in GitHub App settings).
+ */
+router.get('/github/callback', async (req, res) => {
+    const installationId = Number(req.query.installation_id);
+    const state = String(req.query.state || '');
+    if (!Number.isFinite(installationId) || installationId <= 0) {
+        res.status(400).send('Missing installation_id');
+        return;
+    }
+    const payload = githubAppService.verifyInstallState(state);
+    if (!payload) {
+        res.status(400).send('Invalid or expired state');
+        return;
+    }
+    const clientId = payload.clientId;
+    const redirectPath = sanitizeRedirectPath(payload.redirectPath);
+    let accountLogin;
+    let accountType;
+    let repositorySelection;
+    let permissions;
+    try {
+        const info = await githubAppService.getInstallation(installationId);
+        accountLogin = info.account?.login;
+        accountType = info.account?.type;
+        repositorySelection = info.repository_selection;
+        permissions = info.permissions || undefined;
+    }
+    catch {
+        // Non-fatal: still store installation id for later retries.
+    }
+    await githubInstallationsStore.upsertInstallation(clientId, {
+        installationId,
+        accountLogin,
+        accountType,
+        repositorySelection,
+        permissions,
+    });
+    const frontendUrl = (process.env.HIPAA_AGENT_FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    const sep = redirectPath.includes('?') ? '&' : '?';
+    res.redirect(`${frontendUrl}${redirectPath}${sep}github_installation_id=${encodeURIComponent(String(installationId))}`);
+});
+/**
+ * GET /api/github/installations
+ * List GitHub App installations for this browser client.
+ */
+router.get('/github/installations', async (req, res) => {
+    const clientId = getClientId(req);
+    const installations = await githubInstallationsStore.listInstallations(clientId);
+    res.json({ installations });
+});
+/**
+ * GET /api/github/repos?installationId=123
+ * List repositories accessible by a given installation.
+ */
+router.get('/github/repos', async (req, res) => {
+    if (!githubAppService.isConfigured()) {
+        res.status(501).json({ error: 'GitHub App is not configured on the server' });
+        return;
+    }
+    const clientId = getClientId(req);
+    const installationId = Number(req.query.installationId);
+    if (!Number.isFinite(installationId) || installationId <= 0) {
+        res.status(400).json({ error: 'installationId is required' });
+        return;
+    }
+    const allowed = await githubInstallationsStore.getInstallation(clientId, installationId);
+    if (!allowed) {
+        res.status(403).json({ error: 'Unknown installation for this client' });
+        return;
+    }
+    try {
+        const repos = await githubAppService.listInstallationRepositories(installationId);
+        res.json({
+            installationId,
+            repos: repos.map(r => ({
+                id: r.id,
+                fullName: r.full_name,
+                name: r.name,
+                private: r.private,
+                owner: r.owner?.login,
+                defaultBranch: r.default_branch,
+            })),
+        });
+    }
+    catch (e) {
+        res.status(502).json({ error: e?.message || 'Failed to list repositories' });
+    }
+});
 /**
  * POST /api/analyze
- * Start analysis of a GitHub repository (public repos - no token needed)
+ * Start analysis of a repository (local path or GitHub; GitHub App installation optional for private repos)
  */
 router.post('/analyze', async (req, res) => {
-    const { repoUrl } = req.body;
+    const body = (req.body || {});
+    const repoUrl = String(body.repoUrl || '');
+    const githubInstallationId = body.githubInstallationId != null && body.githubInstallationId !== ''
+        ? Number(body.githubInstallationId)
+        : undefined;
     if (!repoUrl) {
         res.status(400).json({ error: 'repoUrl is required' });
         return;
+    }
+    const clientId = getClientId(req);
+    if (githubInstallationId != null) {
+        if (!Number.isFinite(githubInstallationId) || githubInstallationId <= 0) {
+            res.status(400).json({ error: 'githubInstallationId must be a positive number' });
+            return;
+        }
+        if (!githubAppService.isConfigured()) {
+            res.status(501).json({ error: 'GitHub App is not configured on the server' });
+            return;
+        }
+        const allowed = await githubInstallationsStore.getInstallation(clientId, githubInstallationId);
+        if (!allowed) {
+            res.status(403).json({ error: 'Unknown GitHub installation for this client. Connect GitHub first.' });
+            return;
+        }
     }
     const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     // Initialize session
@@ -37,13 +196,32 @@ router.post('/analyze', async (req, res) => {
         progress: 0,
         message: 'Starting analysis...',
         createdAt: new Date().toISOString(),
+        githubInstallationId: githubInstallationId != null ? githubInstallationId : undefined,
     });
     // Return session ID immediately
     res.json({ sessionId, message: 'Analysis started' });
     // Run analysis in background
-    runAnalysis(sessionId, repoUrl);
+    runAnalysis(sessionId, repoUrl, { clientId, githubInstallationId: githubInstallationId != null ? githubInstallationId : undefined });
 });
-async function runAnalysis(sessionId, repoUrl) {
+function parseGitHubRepoFullNameFromUrl(normalizedRepoUrl) {
+    try {
+        const u = new URL(normalizedRepoUrl);
+        if (u.hostname !== 'github.com')
+            return null;
+        const parts = u.pathname.split('/').filter(Boolean);
+        if (parts.length < 2)
+            return null;
+        const owner = parts[0];
+        const repo = parts[1].replace(/\.git$/i, '');
+        if (!owner || !repo)
+            return null;
+        return `${owner}/${repo}`;
+    }
+    catch {
+        return null;
+    }
+}
+async function runAnalysis(sessionId, repoUrl, options) {
     const session = sessions.get(sessionId);
     const service = new GitHubService();
     try {
@@ -52,11 +230,22 @@ async function runAnalysis(sessionId, repoUrl) {
         session.status = 'analyzing';
         session.progress = 5;
         session.message = 'Cloning repository...';
-        const repoData = await service.fetchRepoForAnalysis(sessionId, repoUrl);
+        const githubInstallationId = options.githubInstallationId;
+        let authToken;
+        if (githubInstallationId != null) {
+            const allowed = await githubInstallationsStore.getInstallation(options.clientId, githubInstallationId);
+            if (!allowed) {
+                throw new Error('GitHub installation is not connected for this client. Reconnect GitHub and retry.');
+            }
+            const tok = await githubAppService.createInstallationAccessToken(githubInstallationId);
+            authToken = tok.token;
+        }
+        const repoData = await service.fetchRepoForAnalysis(sessionId, repoUrl, { authToken });
         logger.info({ sessionId, fileCount: repoData.fileTree.length }, 'Repository cloned');
         session.repoUrl = repoUrl;
         session.normalizedRepoUrl = repoData.normalizedRepoUrl;
         session.commitHash = repoData.commitHash;
+        session.githubInstallationId = githubInstallationId;
         session.fileTree = repoData.fileTree;
         session.totalFiles = repoData.fileTree.length;
         session.analyzedFiles = 0;
@@ -106,9 +295,43 @@ async function runAnalysis(sessionId, repoUrl) {
         }
         const analysisResult = analyzer.buildAnalysisResult(totalFiles, analyzedFiles, allFindings);
         logger.info({ sessionId, findings: analysisResult.totalFindings }, 'Analysis complete');
-        session.progress = 90;
-        session.message = `Found ${analysisResult.totalFindings} issues. Generating diagrams...`;
-        // Step 3: Generate Mermaid diagrams (best-effort)
+        session.progress = 86;
+        session.message = `Found ${analysisResult.totalFindings} issues. Identifying third-party services...`;
+        // Step 3: Detect third-party services (dependency-based, best-effort)
+        let thirdPartyServices = [];
+        try {
+            const detected = await detectThirdPartyServices(repoData.repoPath, repoData.fileTree);
+            thirdPartyServices = detected.map(enrichWithLogo);
+        }
+        catch (e) {
+            logger.warn({ err: e, sessionId }, 'Third-party detection failed (ignored)');
+            thirdPartyServices = [];
+        }
+        // Step 4: Research BAA availability (best-effort; bounded)
+        if (thirdPartyServices.length > 0) {
+            session.progress = 89;
+            session.message = `Researching BAAs for ${thirdPartyServices.length} third-party service${thirdPartyServices.length === 1 ? '' : 's'}...`;
+            const MAX_RESEARCH = Number(process.env.HIPAA_AGENT_BAA_RESEARCH_MAX || 10);
+            const next = [];
+            for (let i = 0; i < thirdPartyServices.length; i++) {
+                const svc = thirdPartyServices[i];
+                if (i >= MAX_RESEARCH) {
+                    next.push(svc);
+                    continue;
+                }
+                try {
+                    const baa = await researchBaaForProvider({ name: svc.name, domain: svc.domain });
+                    next.push({ ...svc, baa });
+                }
+                catch {
+                    next.push(svc);
+                }
+            }
+            thirdPartyServices = next;
+        }
+        session.progress = 92;
+        session.message = `Generating diagrams...`;
+        // Step 5: Generate Mermaid diagrams (best-effort)
         const topFindings = [
             ...analysisResult.findingsBySeverity.critical,
             ...analysisResult.findingsBySeverity.high,
@@ -141,11 +364,15 @@ async function runAnalysis(sessionId, repoUrl) {
         session.progress = 100;
         session.status = 'complete';
         session.message = 'Analysis complete';
+        const repoFullName = repoData.normalizedRepoUrl ? parseGitHubRepoFullNameFromUrl(repoData.normalizedRepoUrl) : null;
         session.result = {
             sessionId,
             repoUrl,
             normalizedRepoUrl: repoData.normalizedRepoUrl,
             commitHash: repoData.commitHash,
+            github: (githubInstallationId != null && repoFullName)
+                ? { installationId: githubInstallationId, repoFullName }
+                : undefined,
             createdAt: session.createdAt,
             completedAt: new Date().toISOString(),
             readme: repoData.readme,
@@ -154,6 +381,7 @@ async function runAnalysis(sessionId, repoUrl) {
             resolvedFindings: [],
             patches: [],
             diagrams,
+            thirdPartyServices,
         };
         logger.info({ sessionId }, 'Session complete');
         await sessionStore.saveCompleteSession(session.result);
@@ -215,6 +443,30 @@ router.get('/sessions', async (_req, res) => {
     res.json({ sessions });
 });
 /**
+ * DELETE /api/sessions/:sessionId
+ * Remove a stored session (repo snapshot + result)
+ */
+router.delete('/sessions/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    if (!/^[a-zA-Z0-9_-]{6,128}$/.test(sessionId)) {
+        res.status(400).json({ error: 'Invalid sessionId' });
+        return;
+    }
+    const inMemory = sessions.get(sessionId);
+    if (inMemory && inMemory.status !== 'complete' && inMemory.status !== 'error') {
+        res.status(409).json({ error: 'Cannot delete an in-progress session' });
+        return;
+    }
+    sessions.delete(sessionId);
+    try {
+        await fs.rm(getSessionDir(sessionId), { recursive: true, force: true });
+        res.json({ ok: true });
+    }
+    catch (e) {
+        res.status(500).json({ error: e?.message || 'Failed to delete session' });
+    }
+});
+/**
  * GET /api/sessions/:sessionId/file?path=...
  * Fetch a file's content from the stored repo clone
  */
@@ -252,16 +504,6 @@ router.get('/sessions/:sessionId/file', async (req, res) => {
     const content = await service.readFile(repoPath, filePath);
     res.json({ path: filePath, content, truncated: false });
 });
-function appendBuildLog(job, chunk) {
-    if (!chunk)
-        return;
-    job.logs += chunk;
-    const MAX = 220_000;
-    if (job.logs.length > MAX) {
-        job.logs = job.logs.slice(job.logs.length - MAX);
-        job.logsTruncated = true;
-    }
-}
 async function fileExists(filePath) {
     try {
         await fs.stat(filePath);
@@ -271,173 +513,24 @@ async function fileExists(filePath) {
         return false;
     }
 }
-async function runCommand(job, command, args, cwd, envOverrides) {
-    return new Promise((resolve, reject) => {
-        const child = spawn(command, args, {
-            cwd,
+async function runGit(repoPath, args, envOverrides) {
+    return new Promise((resolve) => {
+        const child = spawn('git', args, {
+            cwd: repoPath,
             env: {
                 ...process.env,
                 ...(envOverrides || {}),
-                CI: '1',
-                npm_config_loglevel: 'notice',
-                npm_config_fund: 'false',
-                npm_config_audit: 'false',
             },
             stdio: ['ignore', 'pipe', 'pipe'],
         });
-        child.stdout.on('data', (d) => appendBuildLog(job, d.toString()));
-        child.stderr.on('data', (d) => appendBuildLog(job, d.toString()));
-        child.on('error', (err) => reject(err));
-        child.on('close', (code) => resolve(typeof code === 'number' ? code : 0));
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d) => { stdout += d.toString(); });
+        child.stderr.on('data', (d) => { stderr += d.toString(); });
+        child.on('close', (code) => resolve({ code: typeof code === 'number' ? code : 0, stdout, stderr }));
+        child.on('error', () => resolve({ code: 1, stdout, stderr: stderr || 'Failed to start git process' }));
     });
 }
-async function runBuildJob(buildId, sessionId, options) {
-    const job = buildJobs.get(buildId);
-    if (!job)
-        return;
-    job.status = 'running';
-    job.startedAt = new Date().toISOString();
-    job.message = 'Preparing build workspace…';
-    const repoPath = getSessionRepoDir(sessionId);
-    const workspaceRoot = path.join(getSessionDir(sessionId), 'build');
-    const workspace = path.join(workspaceRoot, buildId);
-    try {
-        await fs.rm(workspace, { recursive: true, force: true });
-        await fs.mkdir(workspace, { recursive: true });
-        // Copy snapshot into workspace so installs/builds don't mutate the stored repo snapshot.
-        // Node.js >=16 supports fs.cp.
-        // @ts-ignore - types vary by TS/lib target
-        await fs.cp(repoPath, workspace, { recursive: true });
-        const packageJsonPath = path.join(workspace, 'package.json');
-        if (!(await fileExists(packageJsonPath))) {
-            throw new Error('No package.json found in repo snapshot (build runner currently supports Node/npm projects only).');
-        }
-        let scripts = {};
-        try {
-            const pkgRaw = await fs.readFile(packageJsonPath, 'utf-8');
-            const pkg = JSON.parse(pkgRaw);
-            scripts = (pkg && typeof pkg === 'object' && pkg.scripts && typeof pkg.scripts === 'object') ? pkg.scripts : {};
-        }
-        catch {
-            scripts = {};
-        }
-        const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-        if (options.install) {
-            job.message = 'Installing dependencies…';
-            const hasPackageLock = await fileExists(path.join(workspace, 'package-lock.json'));
-            const installArgsBase = hasPackageLock ? ['ci'] : ['install'];
-            if (options.ignoreScripts)
-                installArgsBase.push('--ignore-scripts');
-            // Prefer ci when lock exists; fallback to install if ci fails.
-            let code = await runCommand(job, npmCmd, installArgsBase, workspace, options.env);
-            if (code !== 0 && hasPackageLock) {
-                appendBuildLog(job, `\n[hipaa-agent] npm ci failed (exit ${code}); retrying with npm install…\n`);
-                const retryArgs = ['install'];
-                if (options.ignoreScripts)
-                    retryArgs.push('--ignore-scripts');
-                code = await runCommand(job, npmCmd, retryArgs, workspace, options.env);
-            }
-            if (code !== 0)
-                throw new Error(`Dependency install failed (exit ${code}).`);
-        }
-        const shouldBuild = options.kind === 'build' || options.kind === 'build+test';
-        const shouldTest = options.kind === 'test' || options.kind === 'build+test';
-        if (shouldBuild) {
-            const buildScript = scripts.build ? 'build' : null;
-            if (buildScript) {
-                job.message = `Running ${buildScript}…`;
-                const code = await runCommand(job, npmCmd, ['run', buildScript], workspace, options.env);
-                if (code !== 0)
-                    throw new Error(`${buildScript} failed (exit ${code}).`);
-            }
-            else {
-                appendBuildLog(job, `\n[hipaa-agent] No build script found; skipping build.\n`);
-            }
-        }
-        if (shouldTest) {
-            if (scripts.test) {
-                job.message = 'Running tests…';
-                const code = await runCommand(job, npmCmd, ['test'], workspace, options.env);
-                if (code !== 0)
-                    throw new Error(`Tests failed (exit ${code}).`);
-            }
-            else {
-                appendBuildLog(job, `\n[hipaa-agent] No test script found; skipping tests.\n`);
-            }
-        }
-        job.status = 'complete';
-        job.message = 'Build checks passed';
-        job.exitCode = 0;
-        job.completedAt = new Date().toISOString();
-    }
-    catch (err) {
-        job.status = 'error';
-        const message = err?.message || 'Build failed';
-        job.message = message;
-        job.exitCode = 1;
-        appendBuildLog(job, `\n[hipaa-agent] Build failed: ${message}\n`);
-        job.completedAt = new Date().toISOString();
-    }
-}
-/**
- * POST /api/sessions/:sessionId/build
- * Run best-effort build/test checks in an isolated workspace (manual, optional)
- */
-router.post('/sessions/:sessionId/build', async (req, res) => {
-    const { sessionId } = req.params;
-    const kindRaw = String(req.body?.kind || 'build+test');
-    const kind = (kindRaw === 'build' || kindRaw === 'test' || kindRaw === 'build+test') ? kindRaw : 'build+test';
-    const install = req.body?.install === false ? false : true;
-    const ignoreScripts = req.body?.ignoreScripts === true;
-    const envRaw = req.body?.env;
-    let env;
-    if (envRaw && typeof envRaw === 'object' && !Array.isArray(envRaw)) {
-        const out = {};
-        for (const [k, v] of Object.entries(envRaw)) {
-            const key = String(k || '').trim();
-            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
-                continue;
-            const value = typeof v === 'string' ? v : (v == null ? '' : String(v));
-            // Prevent extremely large env payloads.
-            if (value.length > 10_000)
-                continue;
-            out[key] = value;
-        }
-        if (Object.keys(out).length > 0)
-            env = out;
-    }
-    const stored = await sessionStore.loadSessionResult(sessionId);
-    if (!stored) {
-        res.status(404).json({ error: 'Session not found' });
-        return;
-    }
-    const buildId = `build_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-    const job = {
-        buildId,
-        sessionId,
-        status: 'pending',
-        message: 'Queued…',
-        createdAt: new Date().toISOString(),
-        logs: '',
-        logsTruncated: false,
-    };
-    buildJobs.set(buildId, job);
-    res.json({ buildId });
-    runBuildJob(buildId, sessionId, { kind, install, ignoreScripts, env });
-});
-/**
- * GET /api/sessions/:sessionId/build/:buildId
- * Poll build status/logs
- */
-router.get('/sessions/:sessionId/build/:buildId', async (req, res) => {
-    const { sessionId, buildId } = req.params;
-    const job = buildJobs.get(buildId);
-    if (!job || job.sessionId !== sessionId) {
-        res.status(404).json({ error: 'Build not found' });
-        return;
-    }
-    res.json(job);
-});
 /**
  * POST /api/sessions/:sessionId/diagrams/finding
  * Generate a detailed Mermaid diagram for a specific finding
@@ -1158,11 +1251,234 @@ router.post('/sessions/:sessionId/verify', async (req, res) => {
     }
 });
 /**
+ * POST /api/sessions/:sessionId/third-party/confirm
+ * Record whether a BAA is confirmed for a detected third-party service.
+ */
+router.post('/sessions/:sessionId/third-party/confirm', async (req, res) => {
+    const { sessionId } = req.params;
+    const providerId = String(req.body?.providerId || '').trim();
+    const statusRaw = String(req.body?.status || '').trim();
+    if (!providerId) {
+        res.status(400).json({ error: 'providerId is required' });
+        return;
+    }
+    const status = statusRaw === 'confirmed' || statusRaw === 'not_confirmed' || statusRaw === 'unknown'
+        ? statusRaw
+        : null;
+    if (!status) {
+        res.status(400).json({ error: 'status must be one of: confirmed, not_confirmed, unknown' });
+        return;
+    }
+    const stored = await sessionStore.loadSessionResult(sessionId);
+    if (!stored) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+    }
+    const existing = Array.isArray(stored.thirdPartyServices) ? stored.thirdPartyServices : [];
+    const found = existing.some(s => String(s?.id || '') === providerId);
+    if (!found) {
+        res.status(404).json({ error: 'Provider not found in this session' });
+        return;
+    }
+    const now = new Date().toISOString();
+    const next = existing.map((svc) => {
+        if (String(svc?.id || '') !== providerId)
+            return svc;
+        return {
+            ...svc,
+            confirmation: { status, updatedAt: now },
+        };
+    });
+    const updated = {
+        ...stored,
+        thirdPartyServices: next,
+    };
+    await sessionStore.saveCompleteSession(updated);
+    const mem = sessions.get(sessionId);
+    if (mem && mem.status === 'complete') {
+        mem.result = updated;
+    }
+    res.json({ thirdPartyServices: next });
+});
+/**
+ * POST /api/sessions/:sessionId/github/pr
+ * Create a GitHub Pull Request for the applied patches in this session (GitHub App installation required).
+ */
+router.post('/sessions/:sessionId/github/pr', async (req, res) => {
+    const { sessionId } = req.params;
+    if (!githubAppService.isConfigured()) {
+        res.status(501).json({ error: 'GitHub App is not configured on the server' });
+        return;
+    }
+    const stored = await sessionStore.loadSessionResult(sessionId);
+    if (!stored) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+    }
+    const body = (req.body || {});
+    const clientId = getClientId(req);
+    const installationId = (() => {
+        const fromStored = stored.github?.installationId;
+        if (typeof fromStored === 'number' && Number.isFinite(fromStored) && fromStored > 0)
+            return fromStored;
+        const raw = body.installationId ?? body.githubInstallationId;
+        const n = raw != null ? Number(raw) : NaN;
+        return Number.isFinite(n) && n > 0 ? n : null;
+    })();
+    const repoFullName = (() => {
+        const fromStored = stored.github?.repoFullName;
+        if (typeof fromStored === 'string' && fromStored.includes('/'))
+            return fromStored;
+        const raw = String(body.repoFullName || '').trim();
+        return raw && raw.includes('/') ? raw : null;
+    })();
+    if (!installationId || !repoFullName) {
+        res.status(400).json({ error: 'Missing GitHub repo context. Re-run analysis after connecting GitHub and selecting a repo.' });
+        return;
+    }
+    const allowed = await githubInstallationsStore.getInstallation(clientId, installationId);
+    if (!allowed) {
+        res.status(403).json({ error: 'Unknown GitHub installation for this client' });
+        return;
+    }
+    const repoPath = getSessionRepoDir(sessionId);
+    if (!(await fileExists(path.join(repoPath, '.git')))) {
+        res.status(400).json({ error: 'This session snapshot is not a git repo. PR creation is supported for GitHub-cloned sessions only.' });
+        return;
+    }
+    const appliedPatches = (stored.patches || []).filter(p => Boolean(p.appliedAt));
+    if (appliedPatches.length === 0) {
+        res.status(400).json({ error: 'No applied patches found for this session' });
+        return;
+    }
+    const status = await runGit(repoPath, ['status', '--porcelain']);
+    if (status.code !== 0) {
+        res.status(502).json({ error: status.stderr || 'git status failed' });
+        return;
+    }
+    if (!status.stdout.trim()) {
+        res.status(400).json({ error: 'No working tree changes detected to commit' });
+        return;
+    }
+    const [owner, repo] = repoFullName.split('/', 2);
+    if (!owner || !repo) {
+        res.status(400).json({ error: 'Invalid repoFullName (expected owner/repo)' });
+        return;
+    }
+    const prTitle = String(body.title || '').trim() || 'HIPAA Agent: security fixes';
+    const defaultBody = (() => {
+        const resolvedCount = Array.isArray(stored.resolvedFindings) ? stored.resolvedFindings.length : 0;
+        const lines = [];
+        lines.push('## Summary');
+        lines.push('');
+        lines.push(`- Applied patches: ${appliedPatches.length}`);
+        if (resolvedCount)
+            lines.push(`- Resolved findings (verified): ${resolvedCount}`);
+        lines.push('');
+        lines.push('## Changes');
+        lines.push('');
+        for (const p of appliedPatches.slice(0, 30)) {
+            lines.push(`- ${p.file}${p.explanation ? ` — ${p.explanation}` : ''}`);
+        }
+        if (appliedPatches.length > 30)
+            lines.push(`- …and ${appliedPatches.length - 30} more`);
+        lines.push('');
+        lines.push('## Notes');
+        lines.push('');
+        lines.push('- Please run the project build/tests before merging.');
+        lines.push('- Generated by HIPAA Agent.');
+        lines.push('');
+        return lines.join('\n');
+    })();
+    const prBody = String(body.body || '').trim() || defaultBody;
+    const branchBase = `hipaa-agent/fix-${sessionId.replace(/[^a-zA-Z0-9_-]/g, '').slice(-10) || 'session'}-${Date.now().toString(36)}`;
+    const branchName = String(body.branch || '').trim() || branchBase;
+    const { token } = await githubAppService.createInstallationAccessToken(installationId);
+    const askpassPath = path.join(getSessionDir(sessionId), `.git-askpass_${Date.now()}_${Math.random().toString(16).slice(2)}`);
+    const askpassScript = `#!/bin/sh
+case "$1" in
+  *Username*) echo "x-access-token" ;;
+  *Password*) echo "$HIPAA_AGENT_GIT_TOKEN" ;;
+  *) echo "$HIPAA_AGENT_GIT_TOKEN" ;;
+esac
+`;
+    await fs.writeFile(askpassPath, askpassScript, { encoding: 'utf-8', mode: 0o700 });
+    const gitEnv = {
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_ASKPASS: askpassPath,
+        HIPAA_AGENT_GIT_TOKEN: token,
+    };
+    try {
+        const checkout = await runGit(repoPath, ['checkout', '-b', branchName]);
+        if (checkout.code !== 0) {
+            res.status(502).json({ error: checkout.stderr || 'git checkout -b failed' });
+            return;
+        }
+        const add = await runGit(repoPath, ['add', '-A']);
+        if (add.code !== 0) {
+            res.status(502).json({ error: add.stderr || 'git add failed' });
+            return;
+        }
+        const commit = await runGit(repoPath, [
+            '-c', 'user.email=hipaa-agent@users.noreply.github.com',
+            '-c', 'user.name=HIPAA Agent',
+            'commit',
+            '-m',
+            prTitle,
+        ]);
+        if (commit.code !== 0) {
+            res.status(502).json({ error: commit.stderr || 'git commit failed' });
+            return;
+        }
+        const push = await runGit(repoPath, ['push', '-u', 'origin', branchName], gitEnv);
+        if (push.code !== 0) {
+            res.status(502).json({ error: push.stderr || 'git push failed' });
+            return;
+        }
+        let baseBranch = String(body.base || '').trim();
+        if (!baseBranch) {
+            try {
+                const repoInfo = await githubAppService.getRepo(owner, repo, installationId);
+                baseBranch = repoInfo.default_branch || 'main';
+            }
+            catch {
+                baseBranch = 'main';
+            }
+        }
+        const pr = await githubAppService.createPullRequest({
+            installationId,
+            owner,
+            repo,
+            title: prTitle,
+            body: prBody,
+            head: `${owner}:${branchName}`,
+            base: baseBranch,
+        });
+        res.json({
+            installationId,
+            repoFullName,
+            branch: branchName,
+            base: baseBranch,
+            pr,
+        });
+    }
+    catch (e) {
+        res.status(502).json({ error: e?.message || 'Failed to create PR' });
+    }
+    finally {
+        await fs.rm(askpassPath, { force: true });
+    }
+});
+/**
  * POST /api/analyze-quick
  * Quick synchronous analysis (for smaller repos)
  */
 router.post('/analyze-quick', async (req, res) => {
-    const { repoUrl } = req.body;
+    const body = (req.body || {});
+    const repoUrl = String(body.repoUrl || '');
+    const githubInstallationId = body.githubInstallationId != null && body.githubInstallationId !== ''
+        ? Number(body.githubInstallationId)
+        : undefined;
     if (!repoUrl) {
         res.status(400).json({ error: 'repoUrl is required' });
         return;
@@ -1171,7 +1487,22 @@ router.post('/analyze-quick', async (req, res) => {
     try {
         // Clone and analyze
         const sessionId = `quick_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-        const repoData = await service.fetchRepoForAnalysis(sessionId, repoUrl);
+        const clientId = getClientId(req);
+        let authToken;
+        if (githubInstallationId != null) {
+            if (!githubAppService.isConfigured()) {
+                res.status(501).json({ error: 'GitHub App is not configured on the server' });
+                return;
+            }
+            const allowed = await githubInstallationsStore.getInstallation(clientId, githubInstallationId);
+            if (!allowed) {
+                res.status(403).json({ error: 'Unknown GitHub installation for this client. Connect GitHub first.' });
+                return;
+            }
+            const tok = await githubAppService.createInstallationAccessToken(githubInstallationId);
+            authToken = tok.token;
+        }
+        const repoData = await service.fetchRepoForAnalysis(sessionId, repoUrl, { authToken });
         const analyzer = new AnalyzerAgent();
         const allFindings = [];
         let analyzedFiles = 0;
@@ -1185,6 +1516,31 @@ router.post('/analyze-quick', async (req, res) => {
             analyzedFiles++;
         }
         const analysisResult = analyzer.buildAnalysisResult(totalFiles, analyzedFiles, allFindings);
+        let thirdPartyServices = [];
+        try {
+            const detected = await detectThirdPartyServices(repoData.repoPath, repoData.fileTree);
+            thirdPartyServices = detected.map(enrichWithLogo);
+            const MAX_RESEARCH = Number(process.env.HIPAA_AGENT_BAA_RESEARCH_MAX || 10);
+            const next = [];
+            for (let i = 0; i < thirdPartyServices.length; i++) {
+                const svc = thirdPartyServices[i];
+                if (i >= MAX_RESEARCH) {
+                    next.push(svc);
+                    continue;
+                }
+                try {
+                    const baa = await researchBaaForProvider({ name: svc.name, domain: svc.domain });
+                    next.push({ ...svc, baa });
+                }
+                catch {
+                    next.push(svc);
+                }
+            }
+            thirdPartyServices = next;
+        }
+        catch {
+            thirdPartyServices = [];
+        }
         res.json({
             sessionId,
             repoUrl,
@@ -1193,6 +1549,8 @@ router.post('/analyze-quick', async (req, res) => {
             readme: repoData.readme,
             fileTree: repoData.fileTree,
             analysis: analysisResult,
+            thirdPartyServices,
+            github: undefined,
             patches: [],
             diagrams: [],
         });

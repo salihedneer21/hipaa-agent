@@ -1,6 +1,14 @@
 /**
  * HIPAA Compliance Rules Knowledge Base
- * Based on HIPAA Security Rule (45 CFR Part 160 and Part 164)
+ *
+ * POC scope:
+ * - Notifications & Communications
+ * - Authentication & Access Control
+ * - Client-Side Data Storage
+ * - Light audit logging
+ *
+ * Note: These "rules" are used as hints for the analyzer to focus on files that are
+ * likely relevant. Final determinations are made by the analyzer with full code context.
  */
 export interface HIPAARule {
     name: string;

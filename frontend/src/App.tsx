@@ -9,13 +9,15 @@ import { FindingsPanel } from './components/FindingsPanel';
 import { DiagramsBrowser } from './components/DiagramsBrowser';
 import { MermaidViewer } from './components/MermaidViewer';
 import { SessionsDialog } from './components/SessionsDialog';
+import { SecurityCenter } from './components/SecurityCenter';
 import { useAnalysis } from './hooks/useAnalysis';
-import { Eye, GitCompare, History, Shield, Search, Wrench, X, Github, Building2, Lock, Globe, RefreshCw, Plus, ChevronDown } from 'lucide-react';
-import type { Diagram, Patch, SessionStatus } from './types';
+import { Eye, GitCompare, History, Shield, Search, Wrench, X, Github, Building2, Lock, Globe, RefreshCw, Plus, ChevronDown, Folder } from 'lucide-react';
+import type { Diagram, Patch, SessionStatus, ThirdPartyBaaConfirmationStatus } from './types';
 import { apiFetch } from './api';
 
 type ViewMode = 'current' | 'original' | 'diff';
 type PreviewIssue = NonNullable<SessionStatus['issuesPreview']>[number];
+type AppView = 'security' | 'workspace';
 
 type GitHubInstallation = {
   installationId: number;
@@ -37,13 +39,13 @@ type GitHubRepoItem = {
 const PROGRESS_MESSAGES: Record<string, string[]> = {
   pending: ['Initializing scanner...', 'Preparing analysis engine...'],
   analyzing: [
-    'Scanning for PHI exposure risks...',
-    'Checking encryption patterns...',
-    'Analyzing authentication flows...',
-    'Inspecting data transmission...',
-    'Validating access controls...',
-    'Reviewing audit logging...',
-    'Checking session management...',
+    'Reviewing notifications (email/SMS/push)...',
+    'Checking for PHI in notification templates...',
+    'Analyzing password and auth flows...',
+    'Validating session timeout and logout behavior...',
+    'Scanning client-side storage usage...',
+    'Reviewing caching and service worker behavior...',
+    'Checking audit logging for PHI access...',
   ],
   finalizing: [
     'Summarizing findings...',
@@ -533,6 +535,8 @@ function App() {
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [selectedLines, setSelectedLines] = useState<number[]>([]);
   const [selectedDiagram, setSelectedDiagram] = useState<string | null>(null);
+  const [appView, setAppView] = useState<AppView>('security');
+  const [activeFindingId, setActiveFindingId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('current');
   const [selectedFileContent, setSelectedFileContent] = useState<string>('');
   const [isFileLoading, setIsFileLoading] = useState(false);
@@ -562,8 +566,31 @@ function App() {
   const [findingDiagramError, setFindingDiagramError] = useState<string | null>(null);
   const [isFindingDiagramLoading, setIsFindingDiagramLoading] = useState(false);
 
-  const { analyze, resume, upsertPatch, upsertDiagram, updateAnalysis, updateFileTree, updateResolvedFindings, sessionId, isLoading, progress, statusMessage, sessionStatus, result, error } = useAnalysis();
+  const { analyze, resume, reset, upsertPatch, upsertDiagram, updateAnalysis, updateFileTree, updateResolvedFindings, updateThirdPartyServices, sessionId, isLoading, progress, statusMessage, sessionStatus, result, error } = useAnalysis();
   const activeSessionId = result?.sessionId || sessionId;
+  const didInitViewForSessionRef = useRef<string | null>(null);
+
+  function formatRepoForInput(repoUrl: string): string {
+    const raw = repoUrl || '';
+    if (/^file:\/\//i.test(raw)) {
+      try {
+        const withoutScheme = raw.replace(/^file:\/\//i, '');
+        return decodeURIComponent(withoutScheme);
+      } catch {
+        return raw;
+      }
+    }
+    return raw.replace(/^https?:\/\/github\.com\//i, '');
+  }
+
+  useEffect(() => {
+    if (!result?.sessionId) return;
+    if (didInitViewForSessionRef.current === result.sessionId) return;
+    didInitViewForSessionRef.current = result.sessionId;
+    setAppView('security');
+    setActiveFindingId(result.analysis?.allFindings?.[0]?.id || null);
+    setRepoUrl(formatRepoForInput(result.repoUrl));
+  }, [result?.sessionId]);
 
   const errorSummary = useMemo(() => {
     if (!error) return '';
@@ -731,18 +758,45 @@ function App() {
     if (exists) setSelectedGithubInstallationId(githubCallbackInstallationId);
   }, [githubCallbackInstallationId, githubInstallations]);
 
+  const startAnalysis = (targetRepoUrl: string) => {
+    const trimmed = (targetRepoUrl || '').trim();
+    if (!trimmed) return;
+
+    setRepoUrl(trimmed);
+    setSelectedFile(null);
+    setSelectedLines([]);
+    setSelectedDiagram(null);
+    setActiveFindingId(null);
+    setAppView('security');
+    setFixPromptOpen(false);
+    setFixTargetFindingId(null);
+    setShowErrorDetails(false);
+
+    const installationId = selectedGithubInstallationId || currentGithubInstallation?.installationId || null;
+    analyze(trimmed, {
+      githubInstallationId: isLikelyLocalRepoInput(trimmed) ? null : installationId,
+    });
+  };
+
   const handleAnalyze = () => {
-    if (repoUrl.trim()) {
-      setSelectedFile(null);
-      setSelectedLines([]);
-      setSelectedDiagram(null);
-      setFixPromptOpen(false);
-      setFixTargetFindingId(null);
-      setShowErrorDetails(false);
-      analyze(repoUrl.trim(), {
-        githubInstallationId: isLikelyLocalRepoInput(repoUrl) ? null : selectedGithubInstallationId,
-      });
-    }
+    startAnalysis(repoUrl);
+  };
+
+  const handleNewScan = () => {
+    reset();
+    setRepoUrl('');
+    setSelectedFile(null);
+    setSelectedLines([]);
+    setSelectedDiagram(null);
+    setActiveFindingId(null);
+    setAppView('security');
+    setFixPromptOpen(false);
+    setFixTargetFindingId(null);
+    setShowErrorDetails(false);
+    setVerifyStatus(null);
+    setPatchReviewOpen(false);
+    setPrDialogOpen(false);
+    setFindingDiagramOpen(false);
   };
 
   const handleSelectFile = (path: string) => {
@@ -755,7 +809,7 @@ function App() {
     setVerifyStatus(null);
   };
 
-  const handleSelectFinding = (selection: { file: string; lines: number[] }) => {
+  const handleSelectFinding = (selection: { file: string; lines: number[]; findingId?: string }) => {
     setSelectedFile(selection.file);
     setSelectedLines(selection.lines);
     setSelectedDiagram(null);
@@ -763,6 +817,7 @@ function App() {
     setFixTargetFindingId(null);
     setViewMode('current');
     setVerifyStatus(null);
+    if (selection.findingId) setActiveFindingId(selection.findingId);
   };
 
   const handleSelectDiagram = (name: string) => {
@@ -938,6 +993,23 @@ function App() {
     setFixPromptOpen(true);
   };
 
+  const openFindingInWorkspace = (findingId: string) => {
+    if (!result) return;
+    const finding = result.analysis.allFindings.find(f => f.id === findingId);
+    if (!finding) return;
+
+    const lines = Array.from(new Set((finding.locations || []).map(l => l.line).filter(n => Number.isFinite(n) && n > 0))).sort((a, b) => a - b);
+    setSelectedFile(finding.file);
+    setSelectedLines(lines);
+    setSelectedDiagram(null);
+    setFixPromptOpen(false);
+    setFixTargetFindingId(null);
+    setViewMode('current');
+    setVerifyStatus(null);
+    setActiveFindingId(findingId);
+    setAppView('workspace');
+  };
+
   const applySelectedFixes = async () => {
     if (!activeSessionId || !patchReviewPatchSetId) return;
     setIsApplyingFix(true);
@@ -1107,6 +1179,24 @@ function App() {
     }
   };
 
+  const confirmThirdPartyBaa = async (providerId: string, status: ThirdPartyBaaConfirmationStatus) => {
+    if (!activeSessionId) return;
+    try {
+      const response = await apiFetch(`/api/sessions/${activeSessionId}/third-party/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ providerId, status }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to update BAA status');
+      if (Array.isArray(data.thirdPartyServices)) {
+        updateThirdPartyServices(data.thirdPartyServices);
+      }
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Failed to update BAA status');
+    }
+  };
+
   const hasAppliedPatches = useMemo(() => {
     return (result?.patches || []).some(p => Boolean(p.appliedAt));
   }, [result?.patches]);
@@ -1245,12 +1335,15 @@ function App() {
         repoUrl={repoUrl}
         onRepoUrlChange={setRepoUrl}
         onAnalyze={handleAnalyze}
+        onNewScan={handleNewScan}
         onOpenSessions={() => setSessionsDialogOpen(true)}
         onOpenGitHub={() => setGithubDialogOpen(true)}
         githubEnabled={githubConfigured}
         githubConnectedLabel={githubConnectedLabel}
         isLoading={isLoading}
         hasResults={!!result}
+        view={appView}
+        onViewChange={setAppView}
       />
 
       {isLoading && (
@@ -1283,7 +1376,21 @@ function App() {
         </div>
       )}
 
-      {result && (
+      {result && appView === 'security' && (
+        <SecurityCenter
+          findings={result.analysis?.allFindings || []}
+          resolvedFindings={result.resolvedFindings || []}
+          thirdPartyServices={result.thirdPartyServices || []}
+          activeFindingId={activeFindingId}
+          sessionId={activeSessionId}
+          onSelectFinding={setActiveFindingId}
+          onOpenInWorkspace={openFindingInWorkspace}
+          onConfirmThirdParty={confirmThirdPartyBaa}
+          onDiagramUpdated={upsertDiagram}
+        />
+      )}
+
+      {result && appView === 'workspace' && (
         <div className="main-layout">
           <aside className="sidebar">
             <FileBrowser
@@ -1344,6 +1451,17 @@ function App() {
               <>
                 <div className="editor-header">
                   <span className="file-path">{selectedDiagramObj.title}</span>
+                  <div className="editor-actions">
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      type="button"
+                      onClick={() => setAppView('security')}
+                      title="Back to the Security Center report"
+                    >
+                      <Shield size={14} />
+                      Report
+                    </button>
+                  </div>
                 </div>
                 <div className="editor-container">
                   <MermaidViewer
@@ -1358,6 +1476,15 @@ function App() {
                 <div className="editor-header">
                   <span className="file-path">{selectedFile}</span>
                   <div className="editor-actions">
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      type="button"
+                      onClick={() => setAppView('security')}
+                      title="Back to the Security Center report"
+                    >
+                      <Shield size={14} />
+                      Report
+                    </button>
                     {fileHasFindings && !fixPromptOpen && (
                       <button
                         className="btn btn-secondary btn-sm"
@@ -1813,8 +1940,8 @@ function App() {
                             type="button"
                             className="github-repo-item"
                             onClick={() => {
-                              setRepoUrl(r.fullName);
                               setGithubDialogOpen(false);
+                              startAnalysis(r.fullName);
                             }}
                             title={`Select ${r.fullName}`}
                           >
@@ -1980,8 +2107,45 @@ function App() {
             </div>
             <h2>Make your healthcare apps<br />HIPAA compliant</h2>
             <p style={{ maxWidth: '400px', margin: '0 auto 2.5rem' }}>
-              Scan a GitHub repository or local project folder for security vulnerabilities and get AI-generated fixes instantly
+              Scan a GitHub repo (or local folder) for HIPAA-focused issues in notifications, authentication, and client-side data storage
             </p>
+            <div className="welcome-scan">
+              <div className="welcome-scan-title">Scan a repository</div>
+              <form
+                className="repo-input welcome-repo-input"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleAnalyze();
+                }}
+              >
+                <div className="input-wrapper">
+                  {isLikelyLocalRepoInput(repoUrl) ? (
+                    <Folder size={16} className="input-icon" />
+                  ) : (
+                    <Github size={16} className="input-icon" />
+                  )}
+                  <input
+                    type="text"
+                    value={repoUrl}
+                    onChange={(e) => setRepoUrl(e.target.value)}
+                    placeholder="github.com/owner/repo, owner/repo, or /path/to/folder"
+                    title="Paste a GitHub repo (owner/repo) or a local folder path (e.g., /Users/you/project)"
+                  />
+                </div>
+                {githubConfigured && (
+                  <button className="btn btn-secondary" type="button" onClick={() => setGithubDialogOpen(true)}>
+                    <Github size={16} />
+                    Pick from GitHub
+                  </button>
+                )}
+                <button className="btn btn-primary" type="submit" disabled={!repoUrl.trim()}>
+                  Analyze
+                </button>
+              </form>
+              <div className="welcome-scan-help">
+                Paste a public repo, or connect GitHub to scan private repos.
+              </div>
+            </div>
             <div className="feature-list">
               <div className="feature">
                 <span className="feature-icon">
@@ -1998,7 +2162,7 @@ function App() {
                 </span>
                 <div>
                   <strong>Detect Issues</strong>
-                  <p>AI identifies PHI exposure, encryption gaps, and security risks</p>
+                  <p>Flag PHI in email/SMS/push, weak auth/session controls, and risky browser storage & caching</p>
                 </div>
               </div>
               <div className="feature">

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { CheckCircle, Clock, Copy, GitCommit, X } from 'lucide-react';
+import { CheckCircle, Clock, Copy, GitCommit, Trash2, X } from 'lucide-react';
 import type { SessionMeta } from '../types';
 import { apiFetch } from '../api';
 
@@ -38,6 +38,7 @@ export function SessionsDialog({
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -85,6 +86,34 @@ export function SessionsDialog({
       setCopiedId(sessionId);
     } catch {
       // ignore
+    }
+  };
+
+  const handleDelete = async (sessionId: string, isActive: boolean) => {
+    const message = isActive
+      ? 'Delete this session? You are currently viewing it. This will remove the stored repo snapshot and findings.'
+      : 'Delete this session? This will remove the stored repo snapshot and findings.';
+    if (!window.confirm(message)) return;
+
+    setDeletingId(sessionId);
+    setLoadError(null);
+    try {
+      const response = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error((data as any)?.error || 'Failed to delete session');
+
+      setSessions(prev => prev.filter(s => s.sessionId !== sessionId));
+      if (isActive) {
+        try {
+          localStorage.removeItem('hipaa-agent:lastSessionId');
+        } catch {
+          // ignore
+        }
+      }
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : 'Failed to delete session');
+    } finally {
+      setDeletingId(prev => (prev === sessionId ? null : prev));
     }
   };
 
@@ -197,6 +226,15 @@ export function SessionsDialog({
                       </div>
 
                       <div className="session-actions">
+                        <button
+                          className="btn btn-secondary btn-sm btn-icon"
+                          type="button"
+                          title="Delete session"
+                          onClick={() => handleDelete(session.sessionId, isActive)}
+                          disabled={deletingId === session.sessionId}
+                        >
+                          <Trash2 size={14} />
+                        </button>
                         <button
                           className="btn btn-primary btn-sm"
                           onClick={() => {

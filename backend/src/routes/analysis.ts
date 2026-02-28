@@ -16,11 +16,13 @@ import { PatcherAgent } from '../agents/patcherAgent.js';
 import { diagramAgent } from '../agents/diagramAgent.js';
 import { diagramFixAgent } from '../agents/diagramFixAgent.js';
 import { patchSetAgent } from '../agents/patchSetAgent.js';
+import { researchBaaForProvider } from '../agents/baaResearchAgent.js';
 import logger from '../utils/logger.js';
 import { sessionStore } from '../services/sessionStore.js';
 import type { StoredDiagram, StoredPatch, StoredResolvedFinding, StoredAnalysisFinding } from '../services/sessionStore.js';
 import { getSessionDir, getSessionRepoDir } from '../utils/storagePaths.js';
 import { ANALYZABLE_EXTENSIONS, SKIP_DIRECTORIES } from '../knowledge/hipaaRules.js';
+import { detectThirdPartyServices, enrichWithLogo, type ThirdPartyServiceCard } from '../services/thirdPartyService.js';
 
 const router: ExpressRouter = Router();
 
@@ -351,10 +353,46 @@ async function runAnalysis(sessionId: string, repoUrl: string, options: { client
     const analysisResult = analyzer.buildAnalysisResult(totalFiles, analyzedFiles, allFindings);
     logger.info({ sessionId, findings: analysisResult.totalFindings }, 'Analysis complete');
 
-    session.progress = 90;
-    session.message = `Found ${analysisResult.totalFindings} issues. Generating diagrams...`;
+    session.progress = 86;
+    session.message = `Found ${analysisResult.totalFindings} issues. Identifying third-party services...`;
 
-    // Step 3: Generate Mermaid diagrams (best-effort)
+    // Step 3: Detect third-party services (dependency-based, best-effort)
+    let thirdPartyServices: ThirdPartyServiceCard[] = [];
+    try {
+      const detected = await detectThirdPartyServices(repoData.repoPath, repoData.fileTree);
+      thirdPartyServices = detected.map(enrichWithLogo);
+    } catch (e: any) {
+      logger.warn({ err: e, sessionId }, 'Third-party detection failed (ignored)');
+      thirdPartyServices = [];
+    }
+
+    // Step 4: Research BAA availability (best-effort; bounded)
+    if (thirdPartyServices.length > 0) {
+      session.progress = 89;
+      session.message = `Researching BAAs for ${thirdPartyServices.length} third-party service${thirdPartyServices.length === 1 ? '' : 's'}...`;
+
+      const MAX_RESEARCH = Number(process.env.HIPAA_AGENT_BAA_RESEARCH_MAX || 10);
+      const next: ThirdPartyServiceCard[] = [];
+      for (let i = 0; i < thirdPartyServices.length; i++) {
+        const svc = thirdPartyServices[i]!;
+        if (i >= MAX_RESEARCH) {
+          next.push(svc);
+          continue;
+        }
+        try {
+          const baa = await researchBaaForProvider({ name: svc.name, domain: svc.domain });
+          next.push({ ...svc, baa });
+        } catch {
+          next.push(svc);
+        }
+      }
+      thirdPartyServices = next;
+    }
+
+    session.progress = 92;
+    session.message = `Generating diagrams...`;
+
+    // Step 5: Generate Mermaid diagrams (best-effort)
     const topFindings = [
       ...analysisResult.findingsBySeverity.critical,
       ...analysisResult.findingsBySeverity.high,
@@ -410,6 +448,7 @@ async function runAnalysis(sessionId: string, repoUrl: string, options: { client
       resolvedFindings: [],
       patches: [],
       diagrams,
+      thirdPartyServices,
     };
 
     logger.info({ sessionId }, 'Session complete');
@@ -475,6 +514,32 @@ router.get('/analyze/:sessionId', async (req: Request, res: Response) => {
 router.get('/sessions', async (_req: Request, res: Response) => {
   const sessions = await sessionStore.listSessions(30);
   res.json({ sessions });
+});
+
+/**
+ * DELETE /api/sessions/:sessionId
+ * Remove a stored session (repo snapshot + result)
+ */
+router.delete('/sessions/:sessionId', async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  if (!/^[a-zA-Z0-9_-]{6,128}$/.test(sessionId)) {
+    res.status(400).json({ error: 'Invalid sessionId' });
+    return;
+  }
+
+  const inMemory = sessions.get(sessionId);
+  if (inMemory && inMemory.status !== 'complete' && inMemory.status !== 'error') {
+    res.status(409).json({ error: 'Cannot delete an in-progress session' });
+    return;
+  }
+
+  sessions.delete(sessionId);
+  try {
+    await fs.rm(getSessionDir(sessionId), { recursive: true, force: true });
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Failed to delete session' });
+  }
 });
 
 /**
@@ -1376,6 +1441,65 @@ router.post('/sessions/:sessionId/verify', async (req: Request, res: Response) =
 });
 
 /**
+ * POST /api/sessions/:sessionId/third-party/confirm
+ * Record whether a BAA is confirmed for a detected third-party service.
+ */
+router.post('/sessions/:sessionId/third-party/confirm', async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const providerId = String(req.body?.providerId || '').trim();
+  const statusRaw = String(req.body?.status || '').trim();
+
+  if (!providerId) {
+    res.status(400).json({ error: 'providerId is required' });
+    return;
+  }
+
+  const status = statusRaw === 'confirmed' || statusRaw === 'not_confirmed' || statusRaw === 'unknown'
+    ? statusRaw
+    : null;
+
+  if (!status) {
+    res.status(400).json({ error: 'status must be one of: confirmed, not_confirmed, unknown' });
+    return;
+  }
+
+  const stored = await sessionStore.loadSessionResult(sessionId);
+  if (!stored) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  const existing = Array.isArray((stored as any).thirdPartyServices) ? ((stored as any).thirdPartyServices as any[]) : [];
+  const found = existing.some(s => String(s?.id || '') === providerId);
+  if (!found) {
+    res.status(404).json({ error: 'Provider not found in this session' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const next = existing.map((svc) => {
+    if (String(svc?.id || '') !== providerId) return svc;
+    return {
+      ...svc,
+      confirmation: { status, updatedAt: now },
+    };
+  });
+
+  const updated = {
+    ...stored,
+    thirdPartyServices: next,
+  };
+
+  await sessionStore.saveCompleteSession(updated);
+  const mem = sessions.get(sessionId);
+  if (mem && mem.status === 'complete') {
+    mem.result = updated;
+  }
+
+  res.json({ thirdPartyServices: next });
+});
+
+/**
  * POST /api/sessions/:sessionId/github/pr
  * Create a GitHub Pull Request for the applied patches in this session (GitHub App installation required).
  */
@@ -1612,6 +1736,30 @@ router.post('/analyze-quick', async (req: Request, res: Response) => {
     }
     const analysisResult = analyzer.buildAnalysisResult(totalFiles, analyzedFiles, allFindings);
 
+    let thirdPartyServices: ThirdPartyServiceCard[] = [];
+    try {
+      const detected = await detectThirdPartyServices(repoData.repoPath, repoData.fileTree);
+      thirdPartyServices = detected.map(enrichWithLogo);
+      const MAX_RESEARCH = Number(process.env.HIPAA_AGENT_BAA_RESEARCH_MAX || 10);
+      const next: ThirdPartyServiceCard[] = [];
+      for (let i = 0; i < thirdPartyServices.length; i++) {
+        const svc = thirdPartyServices[i]!;
+        if (i >= MAX_RESEARCH) {
+          next.push(svc);
+          continue;
+        }
+        try {
+          const baa = await researchBaaForProvider({ name: svc.name, domain: svc.domain });
+          next.push({ ...svc, baa });
+        } catch {
+          next.push(svc);
+        }
+      }
+      thirdPartyServices = next;
+    } catch {
+      thirdPartyServices = [];
+    }
+
     res.json({
       sessionId,
       repoUrl,
@@ -1620,6 +1768,7 @@ router.post('/analyze-quick', async (req: Request, res: Response) => {
       readme: repoData.readme,
       fileTree: repoData.fileTree,
       analysis: analysisResult,
+      thirdPartyServices,
       github: undefined,
       patches: [],
       diagrams: [],

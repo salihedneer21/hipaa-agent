@@ -1,8 +1,32 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import type { AnalysisResponse, AnalysisResult, Diagram, Patch, ResolvedFinding, SessionStatus } from '../types';
+import type { AnalysisResponse, AnalysisResult, Diagram, Patch, ResolvedFinding, SessionStatus, ThirdPartyService } from '../types';
 import { apiFetch } from '../api';
 
 const LAST_SESSION_ID_KEY = 'hipaa-agent:lastSessionId';
+
+function safeStorageGet(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeStorageSet(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // ignore
+  }
+}
+
+function safeStorageRemove(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // ignore
+  }
+}
 
 export function useAnalysis() {
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -67,7 +91,7 @@ export function useAnalysis() {
     setResult(null);
     setSessionStatus(null);
     setError(null);
-    localStorage.setItem(LAST_SESSION_ID_KEY, id);
+    safeStorageSet(LAST_SESSION_ID_KEY, id);
     clearPoll();
 
     pollIntervalRef.current = setInterval(() => {
@@ -101,7 +125,7 @@ export function useAnalysis() {
 
       const { sessionId } = await response.json();
       setSessionId(sessionId);
-      localStorage.setItem(LAST_SESSION_ID_KEY, sessionId);
+      safeStorageSet(LAST_SESSION_ID_KEY, sessionId);
 
       // Start polling
       pollIntervalRef.current = setInterval(() => {
@@ -118,7 +142,7 @@ export function useAnalysis() {
   // Auto-restore last session on refresh.
   useEffect(() => {
     if (result || isLoading || sessionId) return;
-    const last = localStorage.getItem(LAST_SESSION_ID_KEY);
+    const last = safeStorageGet(LAST_SESSION_ID_KEY);
     if (last) resume(last);
   }, [isLoading, result, resume, sessionId]);
 
@@ -131,7 +155,7 @@ export function useAnalysis() {
     setSessionStatus(null);
     setError(null);
     setSessionId(null);
-    localStorage.removeItem(LAST_SESSION_ID_KEY);
+    safeStorageRemove(LAST_SESSION_ID_KEY);
   }, [clearPoll]);
 
   const upsertPatch = useCallback((patch: Patch) => {
@@ -181,6 +205,13 @@ export function useAnalysis() {
     });
   }, []);
 
+  const updateThirdPartyServices = useCallback((thirdPartyServices: ThirdPartyService[]) => {
+    setResult(prev => {
+      if (!prev) return prev;
+      return { ...prev, thirdPartyServices };
+    });
+  }, []);
+
   return {
     analyze,
     resume,
@@ -190,6 +221,7 @@ export function useAnalysis() {
     updateAnalysis,
     updateFileTree,
     updateResolvedFindings,
+    updateThirdPartyServices,
     sessionId,
     isLoading,
     progress,

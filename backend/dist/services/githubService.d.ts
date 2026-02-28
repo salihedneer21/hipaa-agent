@@ -14,9 +14,15 @@ export interface RepoData {
     commitHash?: string;
 }
 export declare class GitHubService {
+    private runGit;
     private resolveLocalRepoPath;
     normalizeRepoUrl(repoUrl: string): string;
     cloneRepoToSession(sessionId: string, repoUrl: string): Promise<{
+        repoPath: string;
+        normalizedRepoUrl: string;
+        commitHash?: string;
+    }>;
+    cloneRepoToSessionWithToken(sessionId: string, repoUrl: string, token: string): Promise<{
         repoPath: string;
         normalizedRepoUrl: string;
         commitHash?: string;
@@ -30,6 +36,8 @@ export declare class GitHubService {
     }>;
     writeFile(repoPath: string, filePath: string, content: string): Promise<void>;
     getReadme(repoPath: string): Promise<string | null>;
-    fetchRepoForAnalysis(sessionId: string, repoUrl: string): Promise<RepoData>;
+    fetchRepoForAnalysis(sessionId: string, repoUrl: string, options?: {
+        authToken?: string;
+    }): Promise<RepoData>;
 }
 export declare const githubService: GitHubService;

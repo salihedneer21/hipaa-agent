@@ -20,7 +20,7 @@ interface FindingsPanelProps {
   findings: Finding[];
   resolvedFindings?: ResolvedFinding[];
   selectedFile: string | null;
-  onSelectFinding: (selection: { file: string; lines: number[] }) => void;
+  onSelectFinding: (selection: { file: string; lines: number[]; findingId?: string }) => void;
   onFixFinding?: (findingId: string) => void;
   onViewDiagram?: (findingId: string) => void;
 }
@@ -40,7 +40,7 @@ function FindingCard({
   status,
 }: {
   finding: Finding;
-  onSelectFinding: (selection: { file: string; lines: number[] }) => void;
+  onSelectFinding: (selection: { file: string; lines: number[]; findingId?: string }) => void;
   onFixFinding?: (findingId: string) => void;
   onViewDiagram?: (findingId: string) => void;
   status: 'open' | 'resolved';
@@ -73,9 +73,9 @@ function FindingCard({
         className="finding-card-header"
         role="button"
         tabIndex={0}
-        onClick={() => onSelectFinding({ file: finding.file, lines })}
+        onClick={() => onSelectFinding({ file: finding.file, lines, findingId: finding.id })}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') onSelectFinding({ file: finding.file, lines });
+          if (e.key === 'Enter' || e.key === ' ') onSelectFinding({ file: finding.file, lines, findingId: finding.id });
         }}
         title="Open in editor"
       >
@@ -108,7 +108,7 @@ function FindingCard({
             <button
               key={line}
               className="finding-line-btn"
-              onClick={() => onSelectFinding({ file: finding.file, lines: [line, ...lines.filter(l => l !== line)] })}
+              onClick={() => onSelectFinding({ file: finding.file, lines: [line, ...lines.filter(l => l !== line)], findingId: finding.id })}
               title={`Go to line ${line}`}
             >
               <ChevronRight size={12} />

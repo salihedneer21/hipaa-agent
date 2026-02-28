@@ -1,5 +1,5 @@
 import * as Tooltip from '@radix-ui/react-tooltip';
-import { Folder, Github, History } from 'lucide-react';
+import { Code, Folder, Github, History, Plus, Shield } from 'lucide-react';
 
 const LOGO_URL = 'https://cdn.prod.website-files.com/66acb95cb4494fc16ceefb5c/66acbab0f2243846b02e7c79_Logo.svg';
 
@@ -7,12 +7,15 @@ interface HeaderProps {
   repoUrl: string;
   onRepoUrlChange: (url: string) => void;
   onAnalyze: () => void;
+  onNewScan?: () => void;
   onOpenSessions: () => void;
   onOpenGitHub: () => void;
   githubEnabled: boolean;
   githubConnectedLabel?: string | null;
   isLoading: boolean;
   hasResults: boolean;
+  view?: 'security' | 'workspace';
+  onViewChange?: (view: 'security' | 'workspace') => void;
 }
 
 function isLikelyLocalRepoInput(value: string): boolean {
@@ -30,11 +33,15 @@ export function Header({
   repoUrl,
   onRepoUrlChange,
   onAnalyze,
+  onNewScan,
   onOpenSessions,
   onOpenGitHub,
   githubEnabled,
   githubConnectedLabel,
   isLoading,
+  hasResults,
+  view,
+  onViewChange,
 }: HeaderProps) {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -42,6 +49,7 @@ export function Header({
   };
 
   const isLocal = isLikelyLocalRepoInput(repoUrl);
+  const showNewScan = Boolean(onNewScan) && (hasResults || Boolean(repoUrl.trim()));
 
   return (
     <Tooltip.Provider>
@@ -67,6 +75,31 @@ export function Header({
             />
           </div>
 
+          {hasResults && view && onViewChange && (
+            <div className="view-toggle" role="group" aria-label="View selector">
+              <button
+                type="button"
+                className={`btn btn-secondary btn-sm ${view === 'security' ? 'active' : ''}`}
+                onClick={() => onViewChange('security')}
+                disabled={isLoading}
+                title="Security Center"
+              >
+                <Shield size={16} />
+                Security
+              </button>
+              <button
+                type="button"
+                className={`btn btn-secondary btn-sm ${view === 'workspace' ? 'active' : ''}`}
+                onClick={() => onViewChange('workspace')}
+                disabled={isLoading}
+                title="Workspace"
+              >
+                <Code size={16} />
+                Workspace
+              </button>
+            </div>
+          )}
+
           <Tooltip.Root>
             <Tooltip.Trigger asChild>
               <button
@@ -85,6 +118,27 @@ export function Header({
               </Tooltip.Content>
             </Tooltip.Portal>
           </Tooltip.Root>
+
+          {showNewScan && (
+            <Tooltip.Root>
+              <Tooltip.Trigger asChild>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={onNewScan}
+                  disabled={isLoading}
+                >
+                  <Plus size={16} />
+                  New scan
+                </button>
+              </Tooltip.Trigger>
+              <Tooltip.Portal>
+                <Tooltip.Content className="tooltip-content" sideOffset={5}>
+                  Clear the current session and start over
+                </Tooltip.Content>
+              </Tooltip.Portal>
+            </Tooltip.Root>
+          )}
 
           <Tooltip.Root>
             <Tooltip.Trigger asChild>

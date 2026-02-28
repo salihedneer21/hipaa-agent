@@ -29,6 +29,11 @@ export interface Finding {
   properFix?: string;
   hipaaReference?: string;
   confidence?: 'high' | 'medium' | 'low';
+  /**
+   * Optional list of third-party integrations involved in this finding (e.g. "Twilio", "SendGrid").
+   * Used by the UI for BAA confirmation workflows.
+   */
+  integrations?: string[];
 }
 
 export interface AnalysisResult {
@@ -46,21 +51,44 @@ export interface AnalysisResult {
 
 const SYSTEM_INSTRUCTIONS = `You are a HIPAA compliance security expert analyzing source code.
 
-Your task is to identify potential HIPAA violations in the provided code. Focus on:
+This is a scoped POC. Only look for issues in these categories:
 
-1. **PHI Exposure**: Any logging, printing, or exposure of Protected Health Information
-2. **Encryption Issues**: Unencrypted storage or transmission of PHI
-3. **Access Control**: Missing authentication, hardcoded credentials
-4. **Audit Logging**: Missing audit trails for PHI access
-5. **Data Integrity**: SQL injection, input validation issues
-6. **Session Security**: Missing session timeouts, insecure sessions
+1) Notifications & Communications
+   - Email subject lines should not contain PHI
+   - Email bodies should not contain PHI (use secure portal links)
+   - Push notifications should not display PHI
+   - SMS notifications should not contain PHI
+   - In-app notifications should be stored securely (avoid client-side PHI storage)
+   - Notification preview/subtitle text should not expose PHI
 
-For each issue, provide severity (critical/high/medium/low), line number, description, and fix.
-Be thorough but avoid false positives.
+2) Authentication & Access Control
+   - Strong password requirements enforced
+   - Session timeout / automatic logoff implemented
+   - Sessions invalidated on logout
+   - Sessions invalidated on password change
+   - Account lockout / throttling after failed login attempts
+   - Password reset flow does not expose PHI / avoid account enumeration
+   - Password reset tokens expire appropriately
+   - Role-based access control (if applicable)
+   - Users can only access their own PHI (object-level authorization)
+
+3) Client-Side Data Storage
+   - localStorage/sessionStorage/IndexedDB: PHI encrypted before storage (ideally avoid storing PHI)
+   - Cookies containing PHI are avoided; auth cookies are HttpOnly + Secure
+   - Cache headers prevent caching of PHI responses
+   - Service workers do not cache PHI
+   - Client storage cleared on logout
+
+4) Auditing (lite)
+   - Audit logging exists for PHI access and export events (who/what/when/outcome)
+
+Do NOT report other categories (e.g., SQL injection, XSS, general encryption-in-transit, etc.) unless they are directly necessary to explain one of the scoped categories above.
+
+For each issue, provide severity (critical/high/medium/low), line number(s), a clear description, and actionable remediation.
 
 IMPORTANT:
 - Do NOT report one finding per repeated occurrence. Group repeated occurrences into ONE finding with multiple locations.
-- Only report issues with clear evidence (do not flag variable names alone as PHI).`;
+- Only report issues with clear evidence in code (do not flag variable names alone as PHI).`;
 
 export class AnalyzerAgent {
   private agent: Agent;
@@ -75,9 +103,16 @@ export class AnalyzerAgent {
 
   private isCriticalFile(filePath: string): boolean {
     const criticalPatterns = [
-      'auth', 'login', 'patient', 'medical', 'health',
-      'encrypt', 'security', 'api', 'database', 'config',
-      'controller', 'service', 'model', 'route',
+      // Notifications & communications
+      'notify', 'notification', 'email', 'mail', 'sms', 'twilio', 'sendgrid', 'push', 'fcm', 'firebase', 'apns',
+      // Auth & access control
+      'auth', 'login', 'logout', 'session', 'cookie', 'password', 'reset', 'token', 'oauth',
+      // Client-side storage / caching
+      'storage', 'localstorage', 'sessionstorage', 'indexeddb', 'cache', 'service-worker', 'sw', 'workbox',
+      // Common PHI/data paths
+      'patient', 'medical', 'health', 'phi',
+      // General server app hotspots
+      'security', 'api', 'database', 'config', 'controller', 'service', 'model', 'route',
     ];
     const lowerPath = filePath.toLowerCase();
     return criticalPatterns.some(p => lowerPath.includes(p));
@@ -118,8 +153,9 @@ export class AnalyzerAgent {
       }
     }
 
-    // Reduce noise: keep at most a few signals.
-    matches.sort((a, b) => a.severity.localeCompare(b.severity));
+    // Reduce noise: keep at most a few signals (prefer higher severity).
+    const rank = (s: string): number => (s === 'critical' ? 4 : s === 'high' ? 3 : s === 'medium' ? 2 : 1);
+    matches.sort((a, b) => rank(b.severity) - rank(a.severity));
     return matches.slice(0, 8);
   }
 
@@ -200,6 +236,7 @@ export class AnalyzerAgent {
       ? signals.map(s => `- [${s.severity}] ${s.ruleId} @ line ${s.line}: ${s.snippet}`).join('\n')
       : '(No pattern signals; file analyzed because it looks security-sensitive)';
 
+    const allowedRuleIds = ruleIds.join('|');
     const prompt = `Analyze this file for HIPAA compliance issues.
 
 File: ${filePath}
@@ -215,7 +252,7 @@ Return STRICT JSON only (no markdown, no code fences) matching:
 {
   "findings": [
     {
-      "ruleId": "phi_exposure|encryption_at_rest|encryption_in_transit|access_control|audit_logging|sql_injection|xss_vulnerability|session_management|error_handling|third_party|other",
+      "ruleId": "${allowedRuleIds}",
       "severity": "critical|high|medium|low",
       "title": "Short, specific title",
       "issue": "What is wrong and where",
@@ -225,6 +262,7 @@ Return STRICT JSON only (no markdown, no code fences) matching:
       "properFix": "Concrete fix steps / code-level guidance",
       "hipaaReference": "Optional CFR reference if applicable",
       "confidence": "high|medium|low",
+      "integrations": ["Optional list of third-party vendors involved, e.g., Twilio, SendGrid (omit if not applicable)"],
       "locations": [
         { "line": 12, "endLine": 12 }
       ]
@@ -235,6 +273,7 @@ Return STRICT JSON only (no markdown, no code fences) matching:
 Rules:
 - Do NOT output duplicates. If the same issue appears multiple times, create ONE finding with multiple locations.
 - Only output findings with clear evidence in code. Do not flag variable names alone as PHI exposure.
+- Only return findings that match one of the provided ruleIds. If you can't map an issue to a ruleId, do not include it.
 
 Code (line-numbered):
 \`\`\`
@@ -282,6 +321,7 @@ ${code}
       properFix?: string;
       hipaaReference?: string;
       confidence?: string;
+      integrations?: unknown;
       locations?: Array<{ line?: number; endLine?: number }>;
     };
 
@@ -297,9 +337,10 @@ ${code}
 
     const findings: Finding[] = [];
     for (const raw of parsed.findings || []) {
-      const ruleId = typeof raw.ruleId === 'string' ? raw.ruleId : 'other';
+      const ruleId = typeof raw.ruleId === 'string' ? raw.ruleId : '';
       const rule = HIPAA_RULES[ruleId];
-      const ruleName = rule?.name || 'Security Finding';
+      if (!rule) continue;
+      const ruleName = rule.name;
 
       const severityRaw = typeof raw.severity === 'string' ? raw.severity.toLowerCase() : (rule?.severity || 'medium');
       const severity: Finding['severity'] =
@@ -317,7 +358,10 @@ ${code}
           const line = Number(loc.line || 0);
           const endLine = loc.endLine ? Number(loc.endLine) : undefined;
           if (!Number.isFinite(line) || line <= 0) return null;
-          const code = lines[line - 1]?.trim().slice(0, 200);
+          const snippetStart = Math.max(0, line - 2);
+          const snippetEnd = Math.min(lines.length, (endLine && endLine >= line ? endLine : line) + 1);
+          const snippet = lines.slice(snippetStart, snippetEnd).join('\n');
+          const code = snippet.length > 420 ? `${snippet.slice(0, 420)}…` : snippet;
           const location: FindingLocation = { line, code };
           if (endLine && endLine >= line) location.endLine = endLine;
           return location;
@@ -344,6 +388,9 @@ ${code}
           raw.confidence === 'high' || raw.confidence === 'medium' || raw.confidence === 'low'
             ? (raw.confidence as Finding['confidence'])
             : undefined,
+        integrations: Array.isArray(raw.integrations)
+          ? raw.integrations.map(x => (typeof x === 'string' ? x.trim() : '')).filter(Boolean).slice(0, 6)
+          : undefined,
       });
     }
 
@@ -382,6 +429,11 @@ ${code}
       target.properFix = pickLongest(target.properFix, incoming.properFix);
       target.hipaaReference = pickLongest(target.hipaaReference, incoming.hipaaReference);
       target.confidence = target.confidence || incoming.confidence;
+
+      if (Array.isArray(incoming.integrations) && incoming.integrations.length > 0) {
+        const merged = new Set([...(target.integrations || []), ...incoming.integrations]);
+        target.integrations = Array.from(merged).slice(0, 8);
+      }
     };
 
     // Merge duplicates the model might have returned. Prefer grouping by title/issue instead of remediation
@@ -472,6 +524,10 @@ ${code}
       existing.properFix = pickLongest(existing.properFix, f.properFix);
       existing.hipaaReference = pickLongest(existing.hipaaReference, f.hipaaReference);
       existing.confidence = existing.confidence || f.confidence;
+      if (Array.isArray(f.integrations) && f.integrations.length > 0) {
+        const merged = new Set([...(existing.integrations || []), ...f.integrations]);
+        existing.integrations = Array.from(merged).slice(0, 8);
+      }
     }
 
     const dedupedAllFindings = Array.from(byId.values());

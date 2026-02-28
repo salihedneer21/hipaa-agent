@@ -9,7 +9,12 @@ declare global {
   }
 }
 
-const MERMAID_CDN_SRCS = [
+const MERMAID_CDN_MODULE_SRCS = [
+  'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs',
+  'https://unpkg.com/mermaid@10/dist/mermaid.esm.min.mjs',
+];
+
+const MERMAID_CDN_SCRIPT_SRCS = [
   'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js',
   'https://unpkg.com/mermaid@10/dist/mermaid.min.js',
 ];
@@ -21,7 +26,7 @@ async function loadMermaid(): Promise<any> {
   if (window.mermaid) return window.mermaid;
   if (mermaidLoading) return mermaidLoading;
 
-  const loadFrom = (src: string) =>
+  const loadFromScript = (src: string) =>
     new Promise<any>((resolve, reject) => {
       const existing = document.querySelector<HTMLScriptElement>('script[data-mermaid-loader="true"]');
       if (existing && !window.mermaid) {
@@ -40,11 +45,35 @@ async function loadMermaid(): Promise<any> {
       document.head.appendChild(script);
     });
 
+  const loadFromModule = async (src: string): Promise<any | null> => {
+    // Mermaid v10+ publishes an ESM build that does not attach itself to window.
+    // Use runtime import first, then fall back to classic script tags.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const mod: any = await import(/* @vite-ignore */ src);
+    const candidate = mod?.default ?? mod?.mermaid ?? null;
+    if (candidate) {
+      window.mermaid = candidate;
+      return candidate;
+    }
+    if (window.mermaid) return window.mermaid;
+    return null;
+  };
+
   mermaidLoading = (async () => {
     let last: unknown = null;
-    for (const src of MERMAID_CDN_SRCS) {
+    for (const src of MERMAID_CDN_MODULE_SRCS) {
       try {
-        const m = await loadFrom(src);
+        const m = await loadFromModule(src);
+        if (m) return m;
+        last = new Error(`Mermaid module loaded but had no exports (${src})`);
+      } catch (e) {
+        last = e;
+      }
+    }
+
+    for (const src of MERMAID_CDN_SCRIPT_SRCS) {
+      try {
+        const m = await loadFromScript(src);
         if (m) return m;
         last = new Error(`Mermaid loaded but window.mermaid is empty (${src})`);
       } catch (e) {
@@ -69,7 +98,7 @@ function clamp(value: number, min: number, max: number) {
 function isFixableMermaidError(error: string | null): boolean {
   if (!error) return false;
   // Avoid burning agent calls on loader/network failures.
-  return !/failed to load mermaid|mermaid not available/i.test(error);
+  return !/failed to load mermaid|mermaid not available|window\\.mermaid is empty|module loaded but|dynamically imported module|failed to fetch|networkerror|cors|module script|unexpected token 'export'|cannot use import statement/i.test(error);
 }
 
 export function MermaidViewer({
@@ -105,7 +134,7 @@ export function MermaidViewer({
 
   const transformStyle = useMemo(() => {
     return {
-      transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
+      transform: `translate3d(${offset.x}px, ${offset.y}px, 0) scale(${scale})`,
       transformOrigin: '0 0',
     } as const;
   }, [offset.x, offset.y, scale]);

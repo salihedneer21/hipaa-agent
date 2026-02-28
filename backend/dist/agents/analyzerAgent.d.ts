@@ -22,6 +22,11 @@ export interface Finding {
     properFix?: string;
     hipaaReference?: string;
     confidence?: 'high' | 'medium' | 'low';
+    /**
+     * Optional list of third-party integrations involved in this finding (e.g. "Twilio", "SendGrid").
+     * Used by the UI for BAA confirmation workflows.
+     */
+    integrations?: string[];
 }
 export interface AnalysisResult {
     totalFiles: number;

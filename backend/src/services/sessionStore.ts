@@ -29,6 +29,28 @@ export interface StoredPatch {
   appliedAt?: string;
 }
 
+export type StoredThirdPartyBaaAvailability = 'yes' | 'no' | 'partial' | 'unknown';
+export type StoredThirdPartyBaaConfirmationStatus = 'unknown' | 'confirmed' | 'not_confirmed';
+
+export interface StoredThirdPartyService {
+  id: string;
+  name: string;
+  domain?: string;
+  category?: string;
+  logoUrl?: string;
+  evidence?: Array<{ kind: string; value: string; file: string }>;
+  baa?: {
+    availability: StoredThirdPartyBaaAvailability;
+    summary: string;
+    howToGetBaa?: string;
+    pricing?: string;
+    docsUrl?: string;
+    sources?: string[];
+    researchedAt: string;
+  };
+  confirmation?: { status: StoredThirdPartyBaaConfirmationStatus; updatedAt?: string };
+}
+
 export interface StoredAnalysisFinding {
   id: string;
   ruleId: string;
@@ -44,6 +66,7 @@ export interface StoredAnalysisFinding {
   properFix?: string;
   hipaaReference?: string;
   confidence?: 'high' | 'medium' | 'low';
+  integrations?: string[];
 }
 
 export interface StoredResolvedFinding extends StoredAnalysisFinding {
@@ -91,6 +114,7 @@ export interface SessionResult {
   resolvedFindings?: StoredResolvedFinding[];
   patches: StoredPatch[];
   diagrams: StoredDiagram[];
+  thirdPartyServices?: StoredThirdPartyService[];
   error?: string;
 }
 

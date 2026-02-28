@@ -8,6 +8,7 @@ export const DATA_DIR = process.env.HIPAA_AGENT_DATA_DIR
     ? path.resolve(process.env.HIPAA_AGENT_DATA_DIR)
     : path.join(REPO_ROOT_DIR, '.hipaa-agent-data');
 export const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
+export const GITHUB_DIR = path.join(DATA_DIR, 'github');
 export function getSessionDir(sessionId) {
     return path.join(SESSIONS_DIR, sessionId);
 }
@@ -31,4 +32,10 @@ export function getSessionDiagramsDir(sessionId) {
 }
 export function getSessionSummaryPath(sessionId) {
     return path.join(getSessionDir(sessionId), 'summary.md');
+}
+export function getClientGitHubDir(clientId) {
+    return path.join(GITHUB_DIR, 'clients', clientId);
+}
+export function getClientGitHubInstallationsPath(clientId) {
+    return path.join(getClientGitHubDir(clientId), 'installations.json');
 }

@@ -6,10 +6,29 @@ import { simpleGit } from 'simple-git';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { ANALYZABLE_EXTENSIONS, SKIP_DIRECTORIES } from '../knowledge/hipaaRules.js';
 import { getSessionRepoDir } from '../utils/storagePaths.js';
 export class GitHubService {
+    async runGit(args, options = {}) {
+        return new Promise((resolve) => {
+            const child = spawn('git', args, {
+                cwd: options.cwd,
+                env: {
+                    ...process.env,
+                    ...(options.env || {}),
+                },
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            let stdout = '';
+            let stderr = '';
+            child.stdout.on('data', (d) => { stdout += d.toString(); });
+            child.stderr.on('data', (d) => { stderr += d.toString(); });
+            child.on('close', (code) => resolve({ stdout, stderr, code: typeof code === 'number' ? code : 0 }));
+            child.on('error', () => resolve({ stdout, stderr: stderr || 'Failed to start git process', code: 1 }));
+        });
+    }
     resolveLocalRepoPath(repoUrl) {
         const raw = (repoUrl || '').trim();
         if (!raw)
@@ -70,6 +89,38 @@ export class GitHubService {
             commitHash = undefined;
         }
         return { repoPath: clonePath, normalizedRepoUrl, commitHash };
+    }
+    async cloneRepoToSessionWithToken(sessionId, repoUrl, token) {
+        const normalizedRepoUrl = this.normalizeRepoUrl(repoUrl);
+        const clonePath = getSessionRepoDir(sessionId);
+        await fs.rm(clonePath, { recursive: true, force: true });
+        await fs.mkdir(path.dirname(clonePath), { recursive: true });
+        const askpassPath = path.join(path.dirname(clonePath), `.git-askpass_${Date.now()}_${Math.random().toString(16).slice(2)}`);
+        const askpassScript = `#!/bin/sh
+case "$1" in
+  *Username*) echo "x-access-token" ;;
+  *Password*) echo "$HIPAA_AGENT_GIT_TOKEN" ;;
+  *) echo "$HIPAA_AGENT_GIT_TOKEN" ;;
+esac
+`;
+        await fs.writeFile(askpassPath, askpassScript, { encoding: 'utf-8', mode: 0o700 });
+        try {
+            const env = {
+                GIT_TERMINAL_PROMPT: '0',
+                GIT_ASKPASS: askpassPath,
+                HIPAA_AGENT_GIT_TOKEN: token,
+            };
+            const cloned = await this.runGit(['clone', '--depth', '1', normalizedRepoUrl, clonePath], { env });
+            if (cloned.code !== 0) {
+                throw new Error(cloned.stderr || 'git clone failed');
+            }
+            const rev = await this.runGit(['rev-parse', 'HEAD'], { cwd: clonePath });
+            const commitHash = rev.code === 0 ? rev.stdout.trim() : undefined;
+            return { repoPath: clonePath, normalizedRepoUrl, commitHash };
+        }
+        finally {
+            await fs.rm(askpassPath, { force: true });
+        }
     }
     async copyLocalRepoToSession(sessionId, localRepoPath) {
         const absPath = path.resolve(localRepoPath);
@@ -184,7 +235,7 @@ export class GitHubService {
         }
         return null;
     }
-    async fetchRepoForAnalysis(sessionId, repoUrl) {
+    async fetchRepoForAnalysis(sessionId, repoUrl, options) {
         const local = this.resolveLocalRepoPath(repoUrl);
         if (local) {
             const localResult = await this.copyLocalRepoToSession(sessionId, local);
@@ -196,7 +247,10 @@ export class GitHubService {
                 commitHash: localResult.commitHash,
             };
         }
-        const { repoPath, normalizedRepoUrl, commitHash } = await this.cloneRepoToSession(sessionId, repoUrl);
+        const authToken = options?.authToken;
+        const { repoPath, normalizedRepoUrl, commitHash } = authToken
+            ? await this.cloneRepoToSessionWithToken(sessionId, repoUrl, authToken)
+            : await this.cloneRepoToSession(sessionId, repoUrl);
         const fileTree = await this.getFileTree(repoPath);
         const readme = await this.getReadme(repoPath);
         return { repoPath, readme, fileTree, normalizedRepoUrl, commitHash };

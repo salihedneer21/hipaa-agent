@@ -21,6 +21,7 @@ export interface Finding {
   properFix?: string;
   hipaaReference?: string;
   confidence?: 'high' | 'medium' | 'low';
+  integrations?: string[];
 }
 
 export interface ResolvedFinding extends Finding {
@@ -87,7 +88,38 @@ export interface AnalysisResponse {
   resolvedFindings?: ResolvedFinding[];
   patches: Patch[];
   diagrams: Diagram[];
+  thirdPartyServices?: ThirdPartyService[];
   error?: string;
+}
+
+export type ThirdPartyBaaAvailability = 'yes' | 'no' | 'partial' | 'unknown';
+export type ThirdPartyBaaConfirmationStatus = 'unknown' | 'confirmed' | 'not_confirmed';
+
+export interface ThirdPartyServiceEvidence {
+  kind: string;
+  value: string;
+  file: string;
+}
+
+export interface ThirdPartyBaaResearch {
+  availability: ThirdPartyBaaAvailability;
+  summary: string;
+  howToGetBaa?: string;
+  pricing?: string;
+  docsUrl?: string;
+  sources?: string[];
+  researchedAt: string;
+}
+
+export interface ThirdPartyService {
+  id: string;
+  name: string;
+  domain?: string;
+  category?: string;
+  logoUrl?: string;
+  evidence?: ThirdPartyServiceEvidence[];
+  baa?: ThirdPartyBaaResearch;
+  confirmation?: { status: ThirdPartyBaaConfirmationStatus; updatedAt?: string };
 }
 
 export interface SessionStatus {

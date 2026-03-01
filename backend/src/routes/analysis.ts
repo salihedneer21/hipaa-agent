@@ -69,6 +69,7 @@ const sessions = new Map<string, {
   analyzedFiles?: number;
   currentFile?: string;
   issuesPreview?: IssuePreview[];
+  issuesCount?: number;
   result?: any;
   error?: string;
 }>();
@@ -305,6 +306,7 @@ async function runAnalysis(sessionId: string, repoUrl: string, options: { client
     session.totalFiles = repoData.fileTree.length;
     session.analyzedFiles = 0;
     session.issuesPreview = [];
+    session.issuesCount = 0;
 
     session.progress = 15;
     session.message = `Found ${repoData.fileTree.length} files to analyze...`;
@@ -328,6 +330,7 @@ async function runAnalysis(sessionId: string, repoUrl: string, options: { client
 
         const findings = await analyzer.analyzeFile(filePath, content);
         allFindings.push(...findings);
+        session.issuesCount = allFindings.length;
         if (session.issuesPreview) {
           for (const finding of findings) {
             if (session.issuesPreview.length >= 6) break;
@@ -502,6 +505,7 @@ router.get('/analyze/:sessionId', async (req: Request, res: Response) => {
     totalFiles: session.totalFiles,
     analyzedFiles: session.analyzedFiles,
     issuesPreview: session.issuesPreview,
+    issuesCount: session.issuesCount,
     result: session.status === 'complete' ? session.result : undefined,
     error: session.status === 'error' ? session.error : undefined,
   });
@@ -1497,6 +1501,168 @@ router.post('/sessions/:sessionId/third-party/confirm', async (req: Request, res
   }
 
   res.json({ thirdPartyServices: next });
+});
+
+/**
+ * POST /api/sessions/:sessionId/third-party/refresh
+ * Re-detect third-party services for an existing session and (best-effort) refresh BAA research.
+ */
+router.post('/sessions/:sessionId/third-party/refresh', async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const stored = await sessionStore.loadSessionResult(sessionId);
+  if (!stored) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  const repoDir = getSessionRepoDir(sessionId);
+  const fileTree = Array.isArray((stored as any).fileTree) ? ((stored as any).fileTree as string[]) : [];
+
+  const existing = Array.isArray((stored as any).thirdPartyServices) ? ((stored as any).thirdPartyServices as any[]) : [];
+  const existingById = new Map(existing.map((s) => [String(s?.id || ''), s]));
+
+  let thirdPartyServices: ThirdPartyServiceCard[] = [];
+  try {
+    const detected = await detectThirdPartyServices(repoDir, fileTree, { strict: true });
+    thirdPartyServices = detected.map(enrichWithLogo).map((svc) => {
+      const prev = existingById.get(String(svc.id));
+      if (!prev) return svc;
+      return {
+        ...svc,
+        // Preserve manual confirmation and any existing research unless we refresh it below.
+        confirmation: prev.confirmation || svc.confirmation,
+        baa: prev.baa || svc.baa,
+        logoUrl: svc.logoUrl || prev.logoUrl,
+      };
+    });
+  } catch (e: any) {
+    logger.warn({ err: e, sessionId }, 'Third-party refresh failed');
+    res.status(502).json({ error: e?.message || 'Third-party refresh failed' });
+    return;
+  }
+
+  // Best-effort BAA research refresh (bounded).
+  if (thirdPartyServices.length > 0) {
+    const MAX_RESEARCH = Number(process.env.HIPAA_AGENT_BAA_RESEARCH_MAX || 10);
+    const next: ThirdPartyServiceCard[] = [];
+    for (let i = 0; i < thirdPartyServices.length; i++) {
+      const svc = thirdPartyServices[i]!;
+      if (i >= MAX_RESEARCH) {
+        next.push(svc);
+        continue;
+      }
+      // Only re-research if we have no notes yet.
+      if (svc.baa) {
+        next.push(svc);
+        continue;
+      }
+      try {
+        const baa = await researchBaaForProvider({ name: svc.name, domain: svc.domain });
+        next.push({ ...svc, baa });
+      } catch {
+        next.push(svc);
+      }
+    }
+    thirdPartyServices = next;
+  }
+
+  const updated = {
+    ...stored,
+    thirdPartyServices,
+  };
+
+  await sessionStore.saveCompleteSession(updated);
+  const mem = sessions.get(sessionId);
+  if (mem && mem.status === 'complete') {
+    mem.result = updated;
+  }
+
+  res.json({ thirdPartyServices });
+});
+
+/**
+ * POST /api/sessions/:sessionId/third-party/baa/rescan
+ * Re-run BAA web research for existing detected providers (no full repo re-scan).
+ */
+router.post('/sessions/:sessionId/third-party/baa/rescan', async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const stored = await sessionStore.loadSessionResult(sessionId);
+  if (!stored) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  const existing = Array.isArray((stored as any).thirdPartyServices) ? ((stored as any).thirdPartyServices as any[]) : [];
+  if (existing.length === 0) {
+    res.json({ thirdPartyServices: [], rescanned: 0, skipped: 0 });
+    return;
+  }
+
+  const body = (req.body || {}) as any;
+  const mode = typeof body.mode === 'string' ? body.mode : 'failed';
+  const providerIds = Array.isArray(body.providerIds)
+    ? body.providerIds.map((x: any) => String(x || '').trim()).filter(Boolean)
+    : [];
+
+  const envMax = Number(process.env.HIPAA_AGENT_BAA_RESEARCH_MAX || 10);
+  const requestedMax = body.max != null ? Number(body.max) : NaN;
+  const max = Number.isFinite(requestedMax) && requestedMax > 0 ? Math.min(Math.max(requestedMax, 1), 50) : envMax;
+
+  const providerIdSet = providerIds.length > 0 ? new Set(providerIds) : null;
+
+  const shouldRescan = (svc: any): boolean => {
+    if (providerIdSet) return providerIdSet.has(String(svc?.id || ''));
+    if (mode === 'all') return true;
+    const baa = svc?.baa;
+    if (mode === 'missing') return !baa;
+    const availability = String(baa?.availability || 'unknown');
+    const summary = String(baa?.summary || '');
+    const sources = Array.isArray(baa?.sources) ? baa.sources : [];
+
+    const looksFailed =
+      !baa ||
+      availability === 'unknown' ||
+      sources.length === 0 ||
+      /could not research|web research unavailable|failed/i.test(summary);
+
+    if (mode === 'failed') return looksFailed;
+    if (mode === 'unknown') return !baa || availability === 'unknown';
+    return looksFailed;
+  };
+
+  let rescanned = 0;
+  let skipped = 0;
+  const next: any[] = [];
+
+  for (const svc of existing) {
+    if (!shouldRescan(svc) || rescanned >= max) {
+      next.push(svc);
+      skipped++;
+      continue;
+    }
+
+    try {
+      const baa = await researchBaaForProvider({ name: String(svc?.name || ''), domain: svc?.domain ? String(svc.domain) : undefined }, { force: true });
+      next.push({ ...svc, baa });
+    } catch {
+      next.push(svc);
+    } finally {
+      rescanned++;
+    }
+  }
+
+  const updated = {
+    ...stored,
+    thirdPartyServices: next,
+  };
+
+  await sessionStore.saveCompleteSession(updated);
+  const mem = sessions.get(sessionId);
+  if (mem && mem.status === 'complete') {
+    mem.result = updated;
+  }
+
+  res.json({ thirdPartyServices: next, rescanned, skipped });
 });
 
 /**

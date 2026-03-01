@@ -54,6 +54,8 @@ export function SecurityCenter({
   onSelectFinding,
   onOpenInWorkspace,
   onConfirmThirdParty,
+  onRescanThirdPartyBaas,
+  onRefreshThirdPartyProviders,
   onDiagramUpdated,
 }: {
   findings: Finding[];
@@ -64,6 +66,8 @@ export function SecurityCenter({
   onSelectFinding: (findingId: string) => void;
   onOpenInWorkspace: (findingId: string) => void;
   onConfirmThirdParty: (providerId: string, status: ThirdPartyBaaConfirmationStatus) => Promise<void>;
+  onRescanThirdPartyBaas?: () => Promise<void>;
+  onRefreshThirdPartyProviders?: () => Promise<void>;
   onDiagramUpdated?: (diagram: Diagram) => void;
 }) {
   const [tab, setTab] = useState<Tab>('issues');
@@ -169,7 +173,12 @@ export function SecurityCenter({
 
       <main className="security-center-main">
         {tab === 'baa' ? (
-          <ThirdPartyBAADeck services={thirdPartyServices || []} onConfirm={onConfirmThirdParty} />
+          <ThirdPartyBAADeck
+            services={thirdPartyServices || []}
+            onConfirm={onConfirmThirdParty}
+            onRescan={onRescanThirdPartyBaas}
+            onRefreshProviders={onRefreshThirdPartyProviders}
+          />
         ) : activeFinding ? (
           <FindingReport
             finding={activeFinding}

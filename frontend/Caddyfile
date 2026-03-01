@@ -1,0 +1,13 @@
+hipaa.salihedneer.com {
+	# Serve static files
+	root * /srv
+	file_server
+
+	# API proxy to backend
+	handle /api/* {
+		reverse_proxy backend:3001
+	}
+
+	# SPA fallback for React Router
+	try_files {path} /index.html
+}

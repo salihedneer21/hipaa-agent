@@ -4,3 +4,11 @@
 .env.development.local
 .env.test.local
 .env.production.local
+*.pem
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/

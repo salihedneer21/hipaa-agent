@@ -1,0 +1,52 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      HIPAA_AGENT_DATA_DIR: /data
+
+      # From .env (copy from .env.example). These are optional unless you need the feature.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      HIPAA_AGENT_ENABLE_TRACING: ${HIPAA_AGENT_ENABLE_TRACING:-}
+      LOG_LEVEL: ${LOG_LEVEL:-}
+
+      HIPAA_AGENT_THIRD_PARTY_MODEL: ${HIPAA_AGENT_THIRD_PARTY_MODEL:-}
+      HIPAA_AGENT_BAA_RESEARCH_MODEL: ${HIPAA_AGENT_BAA_RESEARCH_MODEL:-}
+      HIPAA_AGENT_BAA_RESEARCH_MAX: ${HIPAA_AGENT_BAA_RESEARCH_MAX:-}
+
+      GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-}
+      GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
+      GITHUB_APP_STATE_SECRET: ${GITHUB_APP_STATE_SECRET:-}
+      HIPAA_AGENT_FRONTEND_URL: ${HIPAA_AGENT_FRONTEND_URL:-}
+    volumes:
+      - hipaa_agent_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  hipaa_agent_data:
+  caddy_data:
+  caddy_config:
+

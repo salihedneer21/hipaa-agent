@@ -24,10 +24,12 @@ function asAvailability(value: unknown): ThirdPartyBaaAvailability {
   return 'unknown';
 }
 
-export async function researchBaaForProvider(input: ResearchInput): Promise<ThirdPartyBaaResearch> {
+export async function researchBaaForProvider(input: ResearchInput, options?: { force?: boolean }): Promise<ThirdPartyBaaResearch> {
   const key = cacheKey(input);
-  const cached = cache.get(key);
-  if (cached) return cached;
+  if (!options?.force) {
+    const cached = cache.get(key);
+    if (cached) return cached;
+  }
 
   const researchedAt = new Date().toISOString();
   const providerLabel = input.domain ? `${input.name} (${input.domain})` : input.name;
@@ -60,7 +62,9 @@ export async function researchBaaForProvider(input: ResearchInput): Promise<Thir
 
 Rules:
 - Prefer official vendor documentation and reputable sources.
-- If details are unclear, set availability="unknown" and explain what to confirm.
+- Only set availability="yes" when you find an explicit, credible statement that the vendor offers a HIPAA BAA (and note any product/plan restrictions).
+- Only set availability="no" when you find an explicit statement they do not offer a BAA / do not support HIPAA.
+- If details are unclear or conditional, set availability="unknown" (or "partial" if only some products/tiers are covered) and explain what to confirm.
 - Do not guess pricing. If not clearly published, say it is not publicly listed.
 - Keep the summary short and actionable (2-4 sentences).`;
 
@@ -145,4 +149,3 @@ Return:
     return fallback;
   }
 }
-

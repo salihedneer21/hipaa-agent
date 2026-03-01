@@ -21,15 +21,20 @@ const MERMAID_CDN_SCRIPT_SRCS = [
 
 let mermaidLoading: Promise<any> | null = null;
 
+function isMermaidApi(value: any): boolean {
+  if (!value) return false;
+  return typeof value.initialize === 'function' && typeof value.render === 'function';
+}
+
 async function loadMermaid(): Promise<any> {
   if (typeof window === 'undefined') return null;
-  if (window.mermaid) return window.mermaid;
+  if (isMermaidApi(window.mermaid)) return window.mermaid;
   if (mermaidLoading) return mermaidLoading;
 
   const loadFromScript = (src: string) =>
     new Promise<any>((resolve, reject) => {
       const existing = document.querySelector<HTMLScriptElement>('script[data-mermaid-loader="true"]');
-      if (existing && !window.mermaid) {
+      if (existing && !isMermaidApi(window.mermaid)) {
         existing.remove();
       }
 
@@ -37,10 +42,55 @@ async function loadMermaid(): Promise<any> {
       script.src = src;
       script.async = true;
       script.dataset.mermaidLoader = 'true';
-      script.onload = () => resolve(window.mermaid);
+      script.onload = () => {
+        const m = window.mermaid;
+        if (!isMermaidApi(m)) {
+          try {
+            delete (window as any).mermaid;
+          } catch {
+            // ignore
+          }
+        }
+        resolve(m);
+      };
       script.onerror = () => {
         script.remove();
         reject(new Error(`Failed to load Mermaid (${src})`));
+      };
+      document.head.appendChild(script);
+    });
+
+  const loadFromModuleViaScript = (src: string) =>
+    new Promise<any>((resolve, reject) => {
+      const existing = document.querySelector<HTMLScriptElement>('script[data-mermaid-loader="true"]');
+      if (existing && !isMermaidApi(window.mermaid)) {
+        existing.remove();
+      }
+
+      const code = `import * as mod from ${JSON.stringify(src)};\nconst candidate = (mod && (mod.default || mod.mermaid || mod)) || null;\nwindow.mermaid = candidate;\n`;
+      const blob = new Blob([code], { type: 'text/javascript' });
+      const blobUrl = URL.createObjectURL(blob);
+
+      const script = document.createElement('script');
+      script.type = 'module';
+      script.src = blobUrl;
+      script.dataset.mermaidLoader = 'true';
+      script.onload = () => {
+        URL.revokeObjectURL(blobUrl);
+        const m = window.mermaid;
+        if (!isMermaidApi(m)) {
+          try {
+            delete (window as any).mermaid;
+          } catch {
+            // ignore
+          }
+        }
+        resolve(m);
+      };
+      script.onerror = () => {
+        URL.revokeObjectURL(blobUrl);
+        script.remove();
+        reject(new Error(`Failed to load Mermaid module script (${src})`));
       };
       document.head.appendChild(script);
     });
@@ -51,11 +101,11 @@ async function loadMermaid(): Promise<any> {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const mod: any = await import(/* @vite-ignore */ src);
     const candidate = mod?.default ?? mod?.mermaid ?? null;
-    if (candidate) {
+    if (isMermaidApi(candidate)) {
       window.mermaid = candidate;
       return candidate;
     }
-    if (window.mermaid) return window.mermaid;
+    if (isMermaidApi(window.mermaid)) return window.mermaid;
     return null;
   };
 
@@ -64,8 +114,18 @@ async function loadMermaid(): Promise<any> {
     for (const src of MERMAID_CDN_MODULE_SRCS) {
       try {
         const m = await loadFromModule(src);
-        if (m) return m;
+        if (isMermaidApi(m)) return m;
         last = new Error(`Mermaid module loaded but had no exports (${src})`);
+      } catch (e) {
+        last = e;
+      }
+    }
+
+    for (const src of MERMAID_CDN_MODULE_SRCS) {
+      try {
+        const m = await loadFromModuleViaScript(src);
+        if (isMermaidApi(m)) return m;
+        last = new Error(`Mermaid module script loaded but window.mermaid is empty (${src})`);
       } catch (e) {
         last = e;
       }
@@ -74,7 +134,7 @@ async function loadMermaid(): Promise<any> {
     for (const src of MERMAID_CDN_SCRIPT_SRCS) {
       try {
         const m = await loadFromScript(src);
-        if (m) return m;
+        if (isMermaidApi(m)) return m;
         last = new Error(`Mermaid loaded but window.mermaid is empty (${src})`);
       } catch (e) {
         last = e;
@@ -134,7 +194,8 @@ export function MermaidViewer({
 
   const transformStyle = useMemo(() => {
     return {
-      transform: `translate3d(${offset.x}px, ${offset.y}px, 0) scale(${scale})`,
+      // Prefer 2D transforms for SVG crispness (3D transforms can trigger bitmap rasterization in some browsers).
+      transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
       transformOrigin: '0 0',
     } as const;
   }, [offset.x, offset.y, scale]);

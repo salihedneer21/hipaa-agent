@@ -131,6 +131,7 @@ export interface SessionStatus {
   totalFiles?: number;
   analyzedFiles?: number;
   issuesPreview?: Array<{ id: string; severity: Severity; file: string; line: number; title: string }>;
+  issuesCount?: number;
   result?: AnalysisResponse;
   error?: string;
 }

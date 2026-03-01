@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { CheckCircle2, ExternalLink, HelpCircle, XCircle } from 'lucide-react';
+import { CheckCircle2, ExternalLink, HelpCircle, RefreshCw, Search, XCircle } from 'lucide-react';
 import type { ThirdPartyService, ThirdPartyBaaConfirmationStatus } from '../types';
 
 function statusLabel(status: ThirdPartyBaaConfirmationStatus): string {
@@ -18,11 +18,17 @@ function availabilityBadge(availability?: string) {
 export function ThirdPartyBAADeck({
   services,
   onConfirm,
+  onRescan,
+  onRefreshProviders,
 }: {
   services: ThirdPartyService[];
   onConfirm: (providerId: string, status: ThirdPartyBaaConfirmationStatus) => Promise<void>;
+  onRescan?: () => Promise<void>;
+  onRefreshProviders?: () => Promise<void>;
 }) {
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRescanning, setIsRescanning] = useState(false);
+  const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
   const [cardMotion, setCardMotion] = useState<'left' | 'right' | null>(null);
 
   const { queue, reviewed } = useMemo(() => {
@@ -39,6 +45,19 @@ export function ThirdPartyBAADeck({
   const current = queue[0] || null;
   const total = queue.length + reviewed.length;
   const reviewedCount = reviewed.length;
+  const canRescan = useMemo(() => {
+    return (services || []).some((s) => {
+      const baa = (s as any)?.baa;
+      const availability = String(baa?.availability || 'unknown');
+      if (!baa) return true;
+      if (availability === 'unknown') return true;
+      const sources = Array.isArray(baa?.sources) ? baa.sources : [];
+      if (sources.length === 0) return true;
+      const summary = String(baa?.summary || '');
+      if (/could not research|web research unavailable|failed/i.test(summary)) return true;
+      return false;
+    });
+  }, [services]);
 
   const submit = async (status: ThirdPartyBaaConfirmationStatus) => {
     if (!current) return;
@@ -53,18 +72,6 @@ export function ThirdPartyBAADeck({
     }
   };
 
-  if (!current && reviewedCount === 0) {
-    return (
-      <div className="baa-empty">
-        <HelpCircle size={28} />
-        <div>
-          <h3>No third-party services detected</h3>
-          <p>We didn’t detect any external vendors from repo signals (dependencies/domains).</p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="baa-deck">
       <div className="baa-deck-header">
@@ -76,6 +83,46 @@ export function ThirdPartyBAADeck({
         </div>
         <div className="baa-deck-progress">
           <span className="baa-deck-count">{reviewedCount}/{total} reviewed</span>
+          {onRefreshProviders ? (
+            <button
+              className="btn btn-secondary btn-sm"
+              type="button"
+              onClick={async () => {
+                if (!onRefreshProviders || isRefreshingProviders) return;
+                setIsRefreshingProviders(true);
+                try {
+                  await onRefreshProviders();
+                } finally {
+                  setIsRefreshingProviders(false);
+                }
+              }}
+              disabled={isSubmitting || isRescanning || isRefreshingProviders}
+              title="Re-detect providers from repo signals (fixes missing vendors like CometChat)"
+            >
+              <Search size={14} className={isRefreshingProviders ? 'spinning' : ''} />
+              {isRefreshingProviders ? 'Detecting…' : 'Refresh providers'}
+            </button>
+          ) : null}
+          {onRescan ? (
+            <button
+              className="btn btn-secondary btn-sm"
+              type="button"
+              onClick={async () => {
+                if (!onRescan || isRescanning) return;
+                setIsRescanning(true);
+                try {
+                  await onRescan();
+                } finally {
+                  setIsRescanning(false);
+                }
+              }}
+              disabled={isSubmitting || isRescanning || !canRescan}
+              title="Re-run web research for providers with missing/unknown BAA results"
+            >
+              <RefreshCw size={14} className={isRescanning ? 'spinning' : ''} />
+              {isRescanning ? 'Rescanning…' : 'Rescan BAAs'}
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -170,12 +217,23 @@ export function ThirdPartyBAADeck({
             </button>
           </div>
         </div>
-      ) : (
+      ) : reviewedCount > 0 ? (
         <div className="baa-all-done">
           <CheckCircle2 size={28} />
           <div>
             <h3>All providers reviewed</h3>
             <p>Nice — you’ve confirmed BAA status for all detected services in this session.</p>
+          </div>
+        </div>
+      ) : (
+        <div className="baa-empty">
+          <HelpCircle size={28} />
+          <div>
+            <h3>No third-party services detected</h3>
+            <p>
+              We didn’t detect any external vendors from repo signals (dependencies/domains). Try “Refresh providers”. If it errors,
+              confirm your backend has <code>OPENAI_API_KEY</code> set.
+            </p>
           </div>
         </div>
       )}

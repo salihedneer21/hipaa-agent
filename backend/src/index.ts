@@ -5,10 +5,15 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import path from 'path';
 import logger from './utils/logger.js';
 import { setTraceProcessors, setTracingDisabled } from '@openai/agents';
 
+// Load env vars from either the current directory (.env) OR the repo root (.env).
+// This prevents a common local-dev pitfall where you run `pnpm --dir backend dev`
+// but your `.env` lives at the repo root.
 dotenv.config();
+dotenv.config({ path: path.resolve(process.cwd(), '..', '.env'), override: false });
 
 // Disable OpenAI Agents tracing by default to avoid noisy export failures in restricted networks.
 // Set HIPAA_AGENT_ENABLE_TRACING=1 to re-enable.

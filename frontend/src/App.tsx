@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { Routes, Route, useNavigate, useParams } from 'react-router-dom';
 import * as Progress from '@radix-ui/react-progress';
 import * as ToggleGroup from '@radix-ui/react-toggle-group';
 import * as Dialog from '@radix-ui/react-dialog';
@@ -11,7 +12,7 @@ import { MermaidViewer } from './components/MermaidViewer';
 import { SessionsDialog } from './components/SessionsDialog';
 import { SecurityCenter } from './components/SecurityCenter';
 import { useAnalysis } from './hooks/useAnalysis';
-import { Eye, GitCompare, History, Shield, Search, Wrench, X, Github, Building2, Lock, Globe, RefreshCw, Plus, ChevronDown, Folder } from 'lucide-react';
+import { Eye, GitCompare, History, Shield, Search, Wrench, X, Github, Building2, Lock, Globe, RefreshCw, Plus, ChevronDown, Folder, ShieldCheck, KeyRound, FileCheck, Database, CheckCircle2, LockKeyhole } from 'lucide-react';
 import type { Diagram, Patch, SessionStatus, ThirdPartyBaaConfirmationStatus } from './types';
 import { apiFetch } from './api';
 
@@ -61,11 +62,15 @@ function SkeletonLoader({
   statusMessage,
   sessionId,
   sessionStatus,
+  repoUrl,
+  onCancel,
 }: {
   progress: number;
   statusMessage: string;
   sessionId: string | null;
   sessionStatus: SessionStatus | null;
+  repoUrl?: string;
+  onCancel?: () => void;
 }) {
   const [displayMessage, setDisplayMessage] = useState(statusMessage);
   const [previewFilePath, setPreviewFilePath] = useState<string>('');
@@ -222,8 +227,18 @@ function SkeletonLoader({
           alt="Logo"
           className="brand-logo"
         />
-        <div className="skeleton skeleton-input"></div>
-        <div className="skeleton skeleton-btn"></div>
+        <div className="loading-repo-pill" title={repoUrl || ''}>
+          <Github size={14} />
+          <span>{repoUrl || 'Scanning repository…'}</span>
+        </div>
+        {onCancel ? (
+          <button className="btn btn-secondary btn-sm" type="button" onClick={onCancel} title="Cancel this scan and start over">
+            <X size={14} />
+            Cancel
+          </button>
+        ) : (
+          <div className="skeleton skeleton-btn"></div>
+        )}
       </div>
 
       <div className="loading-main">
@@ -326,7 +341,7 @@ function SkeletonLoader({
             </div>
             <div className="progress-stat">
               <span className="progress-stat-label">Issues found</span>
-              <span className="progress-stat-value issues">{issues.length}</span>
+              <span className="progress-stat-value issues">{sessionStatus?.issuesCount ?? 0}</span>
             </div>
           </div>
         </div>
@@ -334,194 +349,10 @@ function SkeletonLoader({
     </div>
   );
 }
+function AppContent() {
+  const navigate = useNavigate();
+  const { sessionId: urlSessionId } = useParams<{ sessionId?: string }>();
 
-// Decorative shapes component
-function DecoShapes() {
-  return (
-    <>
-      {/* Top left shapes */}
-      <div style={{
-        position: 'absolute',
-        top: '10%',
-        left: '5%',
-        width: '120px',
-        height: '120px',
-        background: '#dcfce7',
-        borderRadius: '24px',
-        border: '3px solid #a7f3d0',
-        transform: 'rotate(-12deg)',
-        animation: 'float 6s ease-in-out infinite',
-      }}>
-        <div style={{
-          position: 'absolute',
-          top: '30%',
-          left: '25%',
-          width: '12px',
-          height: '12px',
-          background: '#1a1a1a',
-          borderRadius: '50%',
-        }} />
-        <div style={{
-          position: 'absolute',
-          top: '30%',
-          right: '25%',
-          width: '12px',
-          height: '12px',
-          background: '#1a1a1a',
-          borderRadius: '50%',
-        }} />
-        <div style={{
-          position: 'absolute',
-          bottom: '30%',
-          left: '50%',
-          transform: 'translateX(-50%)',
-          width: '24px',
-          height: '12px',
-          borderBottom: '3px solid #1a1a1a',
-          borderRadius: '0 0 12px 12px',
-        }} />
-      </div>
-
-      {/* Top right shape */}
-      <div style={{
-        position: 'absolute',
-        top: '15%',
-        right: '8%',
-        width: '80px',
-        height: '100px',
-        background: '#fef9c3',
-        borderRadius: '16px',
-        border: '3px solid #fde047',
-        transform: 'rotate(8deg)',
-        animation: 'float 5s ease-in-out infinite 0.5s',
-      }}>
-        <div style={{
-          position: 'absolute',
-          top: '35%',
-          left: '25%',
-          width: '8px',
-          height: '8px',
-          background: '#1a1a1a',
-          borderRadius: '50%',
-        }} />
-        <div style={{
-          position: 'absolute',
-          top: '35%',
-          right: '25%',
-          width: '8px',
-          height: '8px',
-          background: '#1a1a1a',
-          borderRadius: '50%',
-        }} />
-      </div>
-
-      {/* Bottom left shape */}
-      <div style={{
-        position: 'absolute',
-        bottom: '15%',
-        left: '8%',
-        width: '100px',
-        height: '80px',
-        background: '#dbeafe',
-        borderRadius: '16px',
-        border: '3px solid #93c5fd',
-        transform: 'rotate(6deg)',
-        animation: 'float 7s ease-in-out infinite 1s',
-      }}>
-        <div style={{
-          position: 'absolute',
-          top: '35%',
-          left: '28%',
-          width: '10px',
-          height: '10px',
-          background: '#1a1a1a',
-          borderRadius: '50%',
-        }} />
-        <div style={{
-          position: 'absolute',
-          top: '35%',
-          right: '28%',
-          width: '10px',
-          height: '10px',
-          background: '#1a1a1a',
-          borderRadius: '50%',
-        }} />
-      </div>
-
-      {/* Bottom right shape */}
-      <div style={{
-        position: 'absolute',
-        bottom: '20%',
-        right: '12%',
-        width: '90px',
-        height: '110px',
-        background: '#fce7f3',
-        borderRadius: '20px',
-        border: '3px solid #f9a8d4',
-        transform: 'rotate(-6deg)',
-        animation: 'float 6s ease-in-out infinite 1.5s',
-      }}>
-        <div style={{
-          position: 'absolute',
-          top: '30%',
-          left: '28%',
-          width: '10px',
-          height: '10px',
-          background: '#1a1a1a',
-          borderRadius: '50%',
-        }} />
-        <div style={{
-          position: 'absolute',
-          top: '30%',
-          right: '28%',
-          width: '10px',
-          height: '10px',
-          background: '#1a1a1a',
-          borderRadius: '50%',
-        }} />
-        <div style={{
-          position: 'absolute',
-          top: '50%',
-          left: '50%',
-          transform: 'translateX(-50%)',
-          width: '20px',
-          height: '10px',
-          border: '3px solid #1a1a1a',
-          borderTop: 'none',
-          borderRadius: '0 0 10px 10px',
-        }} />
-      </div>
-
-      {/* Small accent shapes */}
-      <div style={{
-        position: 'absolute',
-        top: '40%',
-        left: '15%',
-        width: '40px',
-        height: '40px',
-        background: '#ffedd5',
-        borderRadius: '12px',
-        border: '3px solid #fed7aa',
-        transform: 'rotate(15deg)',
-        animation: 'float 4s ease-in-out infinite 0.8s',
-      }} />
-
-      <div style={{
-        position: 'absolute',
-        top: '50%',
-        right: '10%',
-        width: '50px',
-        height: '50px',
-        background: '#f3e8ff',
-        borderRadius: '50%',
-        border: '3px solid #d8b4fe',
-        animation: 'float 5s ease-in-out infinite 1.2s',
-      }} />
-    </>
-  );
-}
-
-function App() {
   const [repoUrl, setRepoUrl] = useState('');
   const [githubDialogOpen, setGithubDialogOpen] = useState(false);
   const [githubConfigured, setGithubConfigured] = useState(false);
@@ -569,6 +400,29 @@ function App() {
   const { analyze, resume, reset, upsertPatch, upsertDiagram, updateAnalysis, updateFileTree, updateResolvedFindings, updateThirdPartyServices, sessionId, isLoading, progress, statusMessage, sessionStatus, result, error } = useAnalysis();
   const activeSessionId = result?.sessionId || sessionId;
   const didInitViewForSessionRef = useRef<string | null>(null);
+  const didAutoResumeRef = useRef<string | null>(null);
+  const didRefreshThirdPartyRef = useRef<string | null>(null);
+
+  // Auto-resume session from URL
+  useEffect(() => {
+    if (!urlSessionId) return;
+    if (didAutoResumeRef.current === urlSessionId) return;
+    if (activeSessionId === urlSessionId) return;
+    if (isLoading) return;
+    didAutoResumeRef.current = urlSessionId;
+    resume(urlSessionId);
+  }, [urlSessionId, activeSessionId, isLoading, resume]);
+
+  // Sync URL with active session
+  useEffect(() => {
+    if (activeSessionId && !isLoading) {
+      const currentPath = window.location.pathname;
+      const expectedPath = `/session/${activeSessionId}`;
+      if (currentPath !== expectedPath) {
+        navigate(expectedPath, { replace: true });
+      }
+    }
+  }, [activeSessionId, isLoading, navigate]);
 
   function formatRepoForInput(repoUrl: string): string {
     const raw = repoUrl || '';
@@ -591,6 +445,51 @@ function App() {
     setActiveFindingId(result.analysis?.allFindings?.[0]?.id || null);
     setRepoUrl(formatRepoForInput(result.repoUrl));
   }, [result?.sessionId]);
+
+  const thirdPartyServicesLookSuspicious = useCallback((services: any[]): boolean => {
+    const list = Array.isArray(services) ? services : [];
+    if (list.length < 6) return false;
+    let suspicious = 0;
+    for (const s of list) {
+      const name = String(s?.name || '').trim().toLowerCase();
+      const domain = String(s?.domain || '').trim().toLowerCase();
+      if (!name || !domain) continue;
+      // Common bad extraction pattern from old sessions: "a.patientId" treated as a domain => provider "A".
+      if (name.length <= 2 && domain.startsWith(`${name}.`)) suspicious++;
+      const parts = domain.split('.').filter(Boolean);
+      if (parts.length === 2 && parts[0]?.length === 1 && (parts[1]?.length || 0) >= 7) suspicious++;
+      if (/[${}_]/.test(domain)) suspicious++;
+    }
+    return suspicious >= 6 || suspicious / Math.max(list.length, 1) > 0.35;
+  }, []);
+
+  const refreshThirdPartyProviders = useCallback(async () => {
+    if (!activeSessionId) return;
+    const sid = activeSessionId;
+    const response = await apiFetch(`/api/sessions/${encodeURIComponent(sid)}/third-party/refresh`, { method: 'POST' });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error((data as any)?.error || 'Failed to refresh third-party services');
+    if (Array.isArray((data as any)?.thirdPartyServices)) {
+      updateThirdPartyServices((data as any).thirdPartyServices);
+    }
+  }, [activeSessionId, updateThirdPartyServices]);
+
+  // If an older session was created before third-party detection existed (or it returned empty),
+  // refresh the detected vendors on-load so the BAA deck isn't blank.
+  useEffect(() => {
+    if (!result?.sessionId) return;
+    if (isLoading) return;
+    const sid = result.sessionId;
+    const existingCount = Array.isArray(result.thirdPartyServices) ? result.thirdPartyServices.length : 0;
+    const shouldAutoRefresh = existingCount === 0 || thirdPartyServicesLookSuspicious(result.thirdPartyServices as any);
+    if (!shouldAutoRefresh) return;
+    if (didRefreshThirdPartyRef.current === sid) return;
+    didRefreshThirdPartyRef.current = sid;
+
+    refreshThirdPartyProviders().catch(() => {
+      // Non-fatal; leave current values rather than blocking the session load.
+    });
+  }, [isLoading, refreshThirdPartyProviders, result?.sessionId, result?.thirdPartyServices, thirdPartyServicesLookSuspicious]);
 
   const errorSummary = useMemo(() => {
     if (!error) return '';
@@ -782,7 +681,7 @@ function App() {
     startAnalysis(repoUrl);
   };
 
-  const handleNewScan = () => {
+  const handleNewScan = useCallback(() => {
     reset();
     setRepoUrl('');
     setSelectedFile(null);
@@ -797,7 +696,9 @@ function App() {
     setPatchReviewOpen(false);
     setPrDialogOpen(false);
     setFindingDiagramOpen(false);
-  };
+    didAutoResumeRef.current = null;
+    navigate('/');
+  }, [reset, navigate]);
 
   const handleSelectFile = (path: string) => {
     setSelectedFile(path);
@@ -1197,6 +1098,24 @@ function App() {
     }
   };
 
+  const rescanThirdPartyBaas = async () => {
+    if (!activeSessionId) return;
+    try {
+      const response = await apiFetch(`/api/sessions/${encodeURIComponent(activeSessionId)}/third-party/baa/rescan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'failed', max: 30 }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error((data as any)?.error || 'Failed to rescan BAAs');
+      if (Array.isArray((data as any)?.thirdPartyServices)) {
+        updateThirdPartyServices((data as any).thirdPartyServices);
+      }
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Failed to rescan BAAs');
+    }
+  };
+
   const hasAppliedPatches = useMemo(() => {
     return (result?.patches || []).some(p => Boolean(p.appliedAt));
   }, [result?.patches]);
@@ -1347,7 +1266,14 @@ function App() {
       />
 
       {isLoading && (
-        <SkeletonLoader progress={progress} statusMessage={statusMessage} sessionId={sessionId} sessionStatus={sessionStatus} />
+        <SkeletonLoader
+          progress={progress}
+          statusMessage={statusMessage}
+          sessionId={sessionId}
+          sessionStatus={sessionStatus}
+          repoUrl={repoUrl}
+          onCancel={handleNewScan}
+        />
       )}
 
       {error && (
@@ -1386,6 +1312,14 @@ function App() {
           onSelectFinding={setActiveFindingId}
           onOpenInWorkspace={openFindingInWorkspace}
           onConfirmThirdParty={confirmThirdPartyBaa}
+          onRescanThirdPartyBaas={rescanThirdPartyBaas}
+          onRefreshThirdPartyProviders={async () => {
+            try {
+              await refreshThirdPartyProviders();
+            } catch (e) {
+              alert(e instanceof Error ? e.message : 'Failed to refresh providers');
+            }
+          }}
           onDiagramUpdated={upsertDiagram}
         />
       )}
@@ -2080,98 +2014,110 @@ function App() {
         open={sessionsDialogOpen}
         onOpenChange={setSessionsDialogOpen}
         currentSessionId={activeSessionId || null}
-        onResumeSession={resume}
+        onResumeSession={(id) => {
+          setSessionsDialogOpen(false);
+          navigate(`/session/${id}`);
+          resume(id);
+        }}
       />
 
       {!result && !isLoading && (
         <div className="welcome-screen">
-          <DecoShapes />
-          <div className="welcome-content">
-            <img
-              src="https://cdn.prod.website-files.com/66acb95cb4494fc16ceefb5c/66acbab0f2243846b02e7c79_Logo.svg"
-              alt="Logo"
-              className="welcome-logo"
-            />
-            <div style={{
-              display: 'inline-flex',
-              padding: '0.5rem 1rem',
-              background: '#f3e8ff',
-              borderRadius: '100px',
-              marginBottom: '1.5rem',
-              fontSize: '0.875rem',
-              fontWeight: 600,
-              color: '#7c3aed',
-              border: '2px solid #e9d5ff'
-            }}>
-              AI-Powered Security Analysis
+          <div className="welcome-deco">
+            <div className="deco-shape deco-shape-1">
+              <ShieldCheck size={28} color="#16a34a" />
             </div>
-            <h2>Make your healthcare apps<br />HIPAA compliant</h2>
-            <p style={{ maxWidth: '400px', margin: '0 auto 2.5rem' }}>
-              Scan a GitHub repo (or local folder) for HIPAA-focused issues in notifications, authentication, and client-side data storage
-            </p>
-            <div className="welcome-scan">
-              <div className="welcome-scan-title">Scan a repository</div>
-              <form
-                className="repo-input welcome-repo-input"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  handleAnalyze();
-                }}
-              >
-                <div className="input-wrapper">
-                  {isLikelyLocalRepoInput(repoUrl) ? (
-                    <Folder size={16} className="input-icon" />
-                  ) : (
-                    <Github size={16} className="input-icon" />
-                  )}
-                  <input
-                    type="text"
-                    value={repoUrl}
-                    onChange={(e) => setRepoUrl(e.target.value)}
-                    placeholder="github.com/owner/repo, owner/repo, or /path/to/folder"
-                    title="Paste a GitHub repo (owner/repo) or a local folder path (e.g., /Users/you/project)"
-                  />
-                </div>
-                {githubConfigured && (
-                  <button className="btn btn-secondary" type="button" onClick={() => setGithubDialogOpen(true)}>
-                    <Github size={16} />
-                    Pick from GitHub
-                  </button>
-                )}
-                <button className="btn btn-primary" type="submit" disabled={!repoUrl.trim()}>
-                  Analyze
-                </button>
-              </form>
-              <div className="welcome-scan-help">
-                Paste a public repo, or connect GitHub to scan private repos.
-              </div>
+            <div className="deco-shape deco-shape-2">
+              <LockKeyhole size={24} color="#ca8a04" />
             </div>
-            <div className="feature-list">
-              <div className="feature">
-                <span className="feature-icon">
-                  <Shield size={20} />
-                </span>
-                <div>
-                  <strong>Scan & Snapshot</strong>
-                  <p>We snapshot the project into a session so you can restore results later</p>
+            <div className="deco-shape deco-shape-3">
+              <Database size={22} color="#2563eb" />
+            </div>
+            <div className="deco-shape deco-shape-4">
+              <FileCheck size={26} color="#db2777" />
+            </div>
+            <div className="deco-shape deco-shape-5">
+              <KeyRound size={18} color="#9333ea" />
+            </div>
+            <div className="deco-shape deco-shape-6">
+              <CheckCircle2 size={22} color="#0d9488" />
+            </div>
+          </div>
+          <div className="welcome-screen-inner">
+            <div className="welcome-content">
+              <div className="welcome-badge">
+                <Shield size={14} />
+                AI-Powered Security Analysis
+              </div>
+              <h1>Make your healthcare apps HIPAA compliant</h1>
+              <p>
+                Scan a GitHub repo or local folder for HIPAA-focused issues in notifications, authentication, and client-side data storage.
+              </p>
+              <div className="welcome-scan">
+                <div className="welcome-scan-title">Scan a repository</div>
+                <form
+                  className="welcome-repo-input"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleAnalyze();
+                  }}
+                >
+                  <div className="input-wrapper">
+                    {isLikelyLocalRepoInput(repoUrl) ? (
+                      <Folder size={16} className="input-icon" />
+                    ) : (
+                      <Github size={16} className="input-icon" />
+                    )}
+                    <input
+                      type="text"
+                      value={repoUrl}
+                      onChange={(e) => setRepoUrl(e.target.value)}
+                      placeholder="owner/repo or /path/to/folder"
+                    />
+                  </div>
+                  <div className="welcome-input-actions">
+                    {githubConfigured && (
+                      <button className="btn btn-secondary" type="button" onClick={() => setGithubDialogOpen(true)}>
+                        <Github size={16} />
+                        GitHub
+                      </button>
+                    )}
+                    <button className="btn btn-primary" type="submit" disabled={!repoUrl.trim()}>
+                      Analyze
+                    </button>
+                  </div>
+                </form>
+                <div className="welcome-scan-help">
+                  Paste a public repo, or connect GitHub to scan private repos.
                 </div>
               </div>
-              <div className="feature">
-                <span className="feature-icon">
-                  <Search size={20} />
-                </span>
-                <div>
-                  <strong>Detect Issues</strong>
-                  <p>Flag PHI in email/SMS/push, weak auth/session controls, and risky browser storage & caching</p>
+              <div className="feature-list">
+                <div className="feature">
+                  <span className="feature-icon">
+                    <Shield size={18} />
+                  </span>
+                  <div>
+                    <strong>Scan & Snapshot</strong>
+                    <p>We snapshot the project so you can restore results later</p>
+                  </div>
                 </div>
-              </div>
-              <div className="feature">
-                <span className="feature-icon">
-                  <Wrench size={20} />
-                </span>
-                <div>
-                  <strong>Generate Fixes</strong>
-                  <p>Get AI-generated patches ready to apply for each issue</p>
+                <div className="feature">
+                  <span className="feature-icon">
+                    <Search size={18} />
+                  </span>
+                  <div>
+                    <strong>Detect Issues</strong>
+                    <p>Flag PHI leaks, weak auth, and risky browser storage</p>
+                  </div>
+                </div>
+                <div className="feature">
+                  <span className="feature-icon">
+                    <Wrench size={18} />
+                  </span>
+                  <div>
+                    <strong>Generate Fixes</strong>
+                    <p>Get AI-generated patches ready to apply</p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2179,6 +2125,15 @@ function App() {
         </div>
       )}
     </div>
+  );
+}
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<AppContent />} />
+      <Route path="/session/:sessionId" element={<AppContent />} />
+    </Routes>
   );
 }
 

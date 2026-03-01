@@ -1,13 +1,13 @@
 hipaa.salihedneer.com {
-	# Serve static files
-	root * /srv
-	file_server
-
-	# API proxy to backend
+	# API proxy to backend - must come first
 	handle /api/* {
 		reverse_proxy backend:3001
 	}
 
-	# SPA fallback for React Router
-	try_files {path} /index.html
+	# Serve static files with SPA fallback
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
 }
